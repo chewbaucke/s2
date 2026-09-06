@@ -431,7 +431,7 @@ impl S2Stream {
 
     /// Set the stream configuration to apply if an append from this handle creates the stream.
     ///
-    /// Sent as the `s2-create-stream-config` header on appends and append sessions. Only takes
+    /// Sent as the `s2-stream-config` header on appends and append sessions. Only takes
     /// effect when the basin has `create_stream_on_append` enabled and the stream does not exist
     /// yet; unset fields inherit the basin's default stream configuration. Ignored if the stream
     /// exists.

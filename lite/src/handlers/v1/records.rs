@@ -364,7 +364,7 @@ pub struct AppendArgs {
         v1t::StreamNamePathSegment,
         s2_api::data::S2FormatHeader,
         s2_api::data::S2EncryptionKeyHeader,
-        s2_api::data::S2CreateStreamConfigHeader,
+        s2_api::data::S2StreamConfigHeader,
     ),
     servers(
         (url = super::paths::cloud_endpoints::BASIN, variables(
@@ -473,7 +473,7 @@ mod tests {
     use futures::TryStreamExt as _;
     use prost::Message as _;
     use s2_api::v1::{
-        config::CREATE_STREAM_CONFIG_HEADER,
+        config::STREAM_CONFIG_HEADER,
         stream::{
             proto,
             s2s::{self, FrameDecoder, SessionMessage},
@@ -770,7 +770,7 @@ mod tests {
         }
     }
 
-    const CREATE_STREAM_CONFIG_HEADER_VALUE: &str =
+    const STREAM_CONFIG_HEADER_VALUE: &str =
         r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#;
 
     fn append_record_input(body: &'static [u8]) -> proto::AppendInput {
@@ -798,10 +798,7 @@ mod tests {
             &app,
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(
-                    CREATE_STREAM_CONFIG_HEADER.as_str(),
-                    CREATE_STREAM_CONFIG_HEADER_VALUE,
-                )
+                .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -837,7 +834,7 @@ mod tests {
                 &app,
                 request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(CREATE_STREAM_CONFIG_HEADER.as_str(), value)
+                    .header(STREAM_CONFIG_HEADER.as_str(), value)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -848,7 +845,7 @@ mod tests {
             assert_eq!(info["code"], "bad_header");
             let message = info["message"].as_str().expect("error message string");
             assert!(
-                message.contains("s2-create-stream-config") && message.contains(expected_message),
+                message.contains("s2-stream-config") && message.contains(expected_message),
                 "{message}"
             );
         }
@@ -873,10 +870,7 @@ mod tests {
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "application/protobuf")
                 .header(header::ACCEPT, "application/protobuf")
-                .header(
-                    CREATE_STREAM_CONFIG_HEADER.as_str(),
-                    CREATE_STREAM_CONFIG_HEADER_VALUE,
-                )
+                .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
                 .body(Body::from(append_record_input(b"hello").encode_to_vec()))
                 .unwrap(),
         )
@@ -912,10 +906,7 @@ mod tests {
             &app,
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "s2s/proto")
-                .header(
-                    CREATE_STREAM_CONFIG_HEADER.as_str(),
-                    CREATE_STREAM_CONFIG_HEADER_VALUE,
-                )
+                .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
                 .body(Body::from(body.freeze()))
                 .unwrap(),
         )
@@ -963,10 +954,7 @@ mod tests {
                 &app,
                 request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                     .header(header::CONTENT_TYPE, "s2s/proto")
-                    .header(
-                        CREATE_STREAM_CONFIG_HEADER.as_str(),
-                        CREATE_STREAM_CONFIG_HEADER_VALUE,
-                    )
+                    .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
                     .body(Body::from_stream(frames_rx))
                     .unwrap(),
             ),

@@ -582,7 +582,7 @@ pub struct AppendOptions {
     pub match_seq_num: Option<u64>,
     pub linger: Duration,
     /// Stream configuration to apply if the append creates the stream on demand
-    /// (sent as the `s2-create-stream-config` header).
+    /// (sent as the `s2-stream-config` header).
     pub create_stream_config: Option<sdk::types::StreamConfig>,
 }
 

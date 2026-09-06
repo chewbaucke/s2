@@ -33,7 +33,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AppendHeaders {
     pub encryption: Option<EncryptionKey>,
-    /// `s2-create-stream-config`
+    /// `s2-stream-config`
     pub create_stream_config: Option<ApiStreamConfig>,
 }
 

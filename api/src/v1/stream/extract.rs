@@ -17,7 +17,7 @@ use crate::{
         extract::{JsonExtractionRejection, ProtoRejection},
     },
     mime::JsonOrProto,
-    v1::{config::CreateStreamConfigHeader, stream::sse::LastEventId},
+    v1::{config::StreamConfigHeader, stream::sse::LastEventId},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -54,7 +54,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let content_type = crate::mime::content_type(req.headers());
         let encryption_key = parse_header_opt::<EncryptionKey>(req.headers())?;
-        let create_stream_config = parse_header_opt::<CreateStreamConfigHeader>(req.headers())?
+        let create_stream_config = parse_header_opt::<StreamConfigHeader>(req.headers())?
             .map(|header| header.0)
             .unwrap_or_default();
 

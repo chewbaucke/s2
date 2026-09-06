@@ -229,7 +229,7 @@ pub enum AppendRequest {
     /// Unary
     Unary {
         encryption_key: Option<EncryptionKey>,
-        /// From the `s2-create-stream-config` header; empty when absent.
+        /// From the `s2-stream-config` header; empty when absent.
         create_stream_config: OptionalStreamConfig,
         input: s2_common::stream::AppendInput,
         response_mime: JsonOrProto,
@@ -237,7 +237,7 @@ pub enum AppendRequest {
     /// S2S bi-directional streaming
     S2s {
         encryption_key: Option<EncryptionKey>,
-        /// From the `s2-create-stream-config` header; empty when absent.
+        /// From the `s2-stream-config` header; empty when absent.
         create_stream_config: OptionalStreamConfig,
         inputs: BoxStream<'static, Result<s2_common::stream::AppendInput, AppendInputStreamError>>,
         response_compression: s2s::CompressionAlgorithm,

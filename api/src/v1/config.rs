@@ -352,18 +352,17 @@ impl From<s2_common::config::StreamConfig> for StreamConfig {
     }
 }
 
-pub static CREATE_STREAM_CONFIG_HEADER: HeaderName =
-    HeaderName::from_static("s2-create-stream-config");
+pub static STREAM_CONFIG_HEADER: HeaderName = HeaderName::from_static("s2-stream-config");
 
-/// Value of the `s2-create-stream-config` header: a JSON-encoded [`StreamConfig`] to apply if the
-/// request creates the stream on demand.
+/// Value of the `s2-stream-config` header: a JSON-encoded [`StreamConfig`] to apply only if the
+/// request creates the stream on demand. It never reconfigures an existing stream.
 ///
 /// Parsing validates the config the same way `CreateStream` does. Only the JSON object form is
 /// accepted, and it must be a single header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateStreamConfigHeader(pub s2_common::config::OptionalStreamConfig);
+pub struct StreamConfigHeader(pub s2_common::config::OptionalStreamConfig);
 
-impl CreateStreamConfigHeader {
+impl StreamConfigHeader {
     /// Encode a [`StreamConfig`] as a compact JSON header value.
     pub fn to_header_value(config: &StreamConfig) -> HeaderValue {
         let json = serde_json::to_string(config).expect("StreamConfig serializes to JSON");
@@ -371,7 +370,7 @@ impl CreateStreamConfigHeader {
     }
 }
 
-impl FromStr for CreateStreamConfigHeader {
+impl FromStr for StreamConfigHeader {
     type Err = s2_common::ValidationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -381,9 +380,9 @@ impl FromStr for CreateStreamConfigHeader {
     }
 }
 
-impl ParseableHeader for CreateStreamConfigHeader {
+impl ParseableHeader for StreamConfigHeader {
     fn name() -> &'static HeaderName {
-        &CREATE_STREAM_CONFIG_HEADER
+        &STREAM_CONFIG_HEADER
     }
 }
 
@@ -1096,7 +1095,7 @@ mod tests {
 
     #[test]
     fn create_stream_config_header_parses_and_validates() {
-        let header: CreateStreamConfigHeader =
+        let header: StreamConfigHeader =
             r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#
                 .parse()
                 .unwrap();
@@ -1113,15 +1112,15 @@ mod tests {
             }
         );
 
-        let empty: CreateStreamConfigHeader = "{}".parse().unwrap();
+        let empty: StreamConfigHeader = "{}".parse().unwrap();
         assert_eq!(empty.0, Default::default());
 
-        let invalid_json = "not json".parse::<CreateStreamConfigHeader>().unwrap_err();
+        let invalid_json = "not json".parse::<StreamConfigHeader>().unwrap_err();
         assert!(invalid_json.to_string().contains("invalid JSON"));
 
         // Same validation as CreateStream.
         let invalid_age =
-            r#"{"retention_policy":{"age":0}}"#.parse::<CreateStreamConfigHeader>().unwrap_err();
+            r#"{"retention_policy":{"age":0}}"#.parse::<StreamConfigHeader>().unwrap_err();
         assert!(
             invalid_age
                 .to_string()
@@ -1141,8 +1140,8 @@ mod tests {
             }),
             delete_on_empty: Some(DeleteOnEmptyConfig { min_age_secs: 60 }),
         };
-        let value = CreateStreamConfigHeader::to_header_value(&config);
-        let parsed: CreateStreamConfigHeader = value.to_str().unwrap().parse().unwrap();
+        let value = StreamConfigHeader::to_header_value(&config);
+        let parsed: StreamConfigHeader = value.to_str().unwrap().parse().unwrap();
         assert_eq!(
             parsed.0,
             s2_common::config::OptionalStreamConfig::try_from(config).unwrap()

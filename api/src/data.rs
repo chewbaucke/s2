@@ -100,17 +100,17 @@ pub struct S2FormatHeader {
 #[derive(Debug)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
 #[cfg_attr(feature = "utoipa", into_params(parameter_in = Header))]
-pub struct S2CreateStreamConfigHeader {
-    /// Stream configuration to apply if this request creates the stream via the basin's `create_stream_on_append` setting,
+pub struct S2StreamConfigHeader {
+    /// Stream configuration to apply only if this request creates the stream via the basin's `create_stream_on_append` setting,
     /// encoded as compact JSON in the shape of `StreamConfig`. Unset fields inherit the basin's `default_stream_config`.
-    /// Ignored if the stream already exists.
+    /// Ignored if the stream already exists; it never reconfigures an existing stream.
     #[cfg_attr(feature = "utoipa", param(
         required = false,
-        rename = "s2-create-stream-config",
+        rename = "s2-stream-config",
         value_type = String,
         example = json!(r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#),
     ))]
-    pub s2_create_stream_config: String,
+    pub s2_stream_config: String,
 }
 
 #[rustfmt::skip]

@@ -19,8 +19,8 @@ use s2_api::v1::{
         BasinInfo, CreateBasinRequest, EnsureBasinRequest, ListBasinsRequest, ListBasinsResponse,
     },
     config::{
-        BasinConfig, BasinReconfiguration, CREATE_STREAM_CONFIG_HEADER, CreateStreamConfigHeader,
-        StreamConfig, StreamReconfiguration,
+        BasinConfig, BasinReconfiguration, STREAM_CONFIG_HEADER, StreamConfig, StreamConfigHeader,
+        StreamReconfiguration,
     },
     location::LocationInfo,
     metrics::{
@@ -967,8 +967,8 @@ fn set_create_stream_config_header(
 ) {
     if let Some(config) = create_stream_config {
         request.headers_mut().insert(
-            CREATE_STREAM_CONFIG_HEADER.clone(),
-            CreateStreamConfigHeader::to_header_value(config),
+            STREAM_CONFIG_HEADER.clone(),
+            StreamConfigHeader::to_header_value(config),
         );
     }
 }
