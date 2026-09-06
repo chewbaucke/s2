@@ -15,9 +15,7 @@ use s2_common::{
 };
 use tokio::time::Instant;
 
-use crate::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, FencingToken, StreamConfig, ValidationError,
-};
+use crate::types::{AppendInput, AppendRecord, AppendRecordBatch, FencingToken, ValidationError};
 
 const RECORD_BATCH_MIN: CountOrBytes = CountOrBytes { count: 1, bytes: 8 };
 
@@ -132,7 +130,6 @@ pub struct AppendInputs {
     pub(crate) batches: AppendRecordBatches,
     pub(crate) fencing_token: Option<FencingToken>,
     pub(crate) match_seq_num: Option<u64>,
-    pub(crate) create_stream_config: Option<StreamConfig>,
 }
 
 impl AppendInputs {
@@ -142,7 +139,6 @@ impl AppendInputs {
             batches,
             fencing_token: None,
             match_seq_num: None,
-            create_stream_config: None,
         }
     }
 
@@ -162,17 +158,6 @@ impl AppendInputs {
             ..self
         }
     }
-
-    /// Set the stream configuration to apply if the stream is created on append.
-    ///
-    /// Only takes effect when the basin has `create_stream_on_append` enabled and the stream does
-    /// not exist yet.
-    pub fn with_create_stream_config(self, create_stream_config: StreamConfig) -> Self {
-        Self {
-            create_stream_config: Some(create_stream_config),
-            ..self
-        }
-    }
 }
 
 impl Stream for AppendInputs {
@@ -189,7 +174,6 @@ impl Stream for AppendInputs {
                     records: batch,
                     match_seq_num,
                     fencing_token: self.fencing_token.clone(),
-                    create_stream_config: self.create_stream_config.clone(),
                 })))
             }
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),

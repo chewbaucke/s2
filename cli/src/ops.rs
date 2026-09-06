@@ -581,7 +581,8 @@ pub struct AppendOptions {
     pub fencing_token: Option<FencingToken>,
     pub match_seq_num: Option<u64>,
     pub linger: Duration,
-    /// Stream configuration to apply if the append creates the stream on demand.
+    /// Stream configuration to apply if the append creates the stream on demand
+    /// (sent as the `s2-create-stream-config` header).
     pub create_stream_config: Option<sdk::types::StreamConfig>,
 }
 
@@ -596,7 +597,10 @@ where
     S: Stream<Item = Result<AppendRecord, E>> + Send + Unpin + 'a,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let stream = stream_with_encryption(s2, uri, encryption_key);
+    let mut stream = stream_with_encryption(s2, uri, encryption_key);
+    if let Some(config) = options.create_stream_config {
+        stream = stream.with_create_stream_config(config);
+    }
 
     let batching_config = BatchingConfig::new().with_linger(options.linger);
     let mut producer_config = ProducerConfig::new().with_batching(batching_config);
@@ -605,9 +609,6 @@ where
     }
     if let Some(seq) = options.match_seq_num {
         producer_config = producer_config.with_match_seq_num(seq);
-    }
-    if let Some(config) = options.create_stream_config {
-        producer_config = producer_config.with_create_stream_config(config);
     }
 
     let producer = stream.producer(producer_config);

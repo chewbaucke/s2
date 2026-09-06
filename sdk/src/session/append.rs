@@ -9,6 +9,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
+use s2_api::v1::config::StreamConfig as ApiStreamConfig;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::Instant,
@@ -27,6 +28,14 @@ use crate::{
         StreamName, StreamPosition, ValidationError,
     },
 };
+
+/// Per-stream options sent as request headers on every (re)connect of an append session.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AppendHeaders {
+    pub encryption: Option<EncryptionKey>,
+    /// `s2-create-stream-config`
+    pub create_stream_config: Option<ApiStreamConfig>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppendSessionError {
@@ -171,7 +180,7 @@ impl AppendSession {
     pub(crate) fn new(
         client: BasinClient,
         stream: StreamName,
-        encryption: Option<EncryptionKey>,
+        headers: AppendHeaders,
         config: AppendSessionConfig,
     ) -> Self {
         let buffer_size = config
@@ -185,7 +194,7 @@ impl AppendSession {
         let handle = AbortOnDropHandle::new(tokio::spawn(run_session_with_retry(
             client,
             stream,
-            encryption,
+            headers,
             cmd_rx,
             retry_builder,
             buffer_size,
@@ -293,11 +302,7 @@ pub(crate) struct AppendSessionInternal {
 }
 
 impl AppendSessionInternal {
-    pub(crate) fn new(
-        client: BasinClient,
-        stream: StreamName,
-        encryption: Option<EncryptionKey>,
-    ) -> Self {
+    pub(crate) fn new(client: BasinClient, stream: StreamName, headers: AppendHeaders) -> Self {
         let buffer_size = DEFAULT_CHANNEL_BUFFER_SIZE;
         let (cmd_tx, cmd_rx) = mpsc::channel(buffer_size);
         let retry_builder = retry_builder(&client.config.retry);
@@ -305,7 +310,7 @@ impl AppendSessionInternal {
         let handle = AbortOnDropHandle::new(tokio::spawn(run_session_with_retry(
             client,
             stream,
-            encryption,
+            headers,
             cmd_rx,
             retry_builder,
             buffer_size,
@@ -410,7 +415,7 @@ impl AppendPermits {
 async fn run_session_with_retry(
     client: BasinClient,
     stream: StreamName,
-    encryption: Option<EncryptionKey>,
+    headers: AppendHeaders,
     cmd_rx: mpsc::Receiver<Command>,
     retry_builder: RetryBackoffBuilder,
     buffer_size: usize,
@@ -438,7 +443,7 @@ async fn run_session_with_retry(
         let result = run_session(
             &client,
             &stream,
-            encryption.as_ref(),
+            &headers,
             &mut state,
             buffer_size,
             &frame_signal,
@@ -510,7 +515,7 @@ async fn run_session_with_retry(
 async fn run_session(
     client: &BasinClient,
     stream: &StreamName,
-    encryption: Option<&EncryptionKey>,
+    headers: &AppendHeaders,
     state: &mut SessionState,
     buffer_size: usize,
     frame_signal: &Option<FrameSignal>,
@@ -519,14 +524,8 @@ async fn run_session(
         s.reset();
     }
 
-    let (input_tx, mut acks) = connect(
-        client,
-        stream,
-        encryption,
-        buffer_size,
-        frame_signal.clone(),
-    )
-    .await?;
+    let (input_tx, mut acks) =
+        connect(client, stream, headers, buffer_size, frame_signal.clone()).await?;
     let ack_timeout = client.config.request_timeout;
 
     if !state.inflight_appends.is_empty() {
@@ -725,7 +724,7 @@ async fn resend(
 async fn connect(
     client: &BasinClient,
     stream: &StreamName,
-    encryption: Option<&EncryptionKey>,
+    headers: &AppendHeaders,
     buffer_size: usize,
     frame_signal: Option<FrameSignal>,
 ) -> Result<(mpsc::Sender<AppendInput>, Streaming<AppendAck>), AppendSessionError> {
@@ -735,7 +734,8 @@ async fn connect(
             .append_session(
                 stream,
                 ReceiverStream::new(input_rx).map(|i| i.into()),
-                encryption,
+                headers.encryption.as_ref(),
+                headers.create_stream_config.as_ref(),
                 frame_signal,
             )
             .await?

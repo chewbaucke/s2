@@ -15,14 +15,11 @@ use s2_common::{
 use s2_storage::record::encrypt_append_input;
 use tokio::sync::oneshot;
 
-use super::{
-    Backend, StreamHandle,
-    core::{AutoCreateOn, StreamLookup},
-};
+use super::{Backend, StreamHandle, core::AutoCreateOn};
 use crate::backend::error::{AppendError, AppendErrorInternal, StorageError};
 
 impl Backend {
-    /// Open a stream for a unary append.
+    /// Open a stream for an append or append session.
     ///
     /// `create_stream_config` is applied over the basin defaults only if this call creates the
     /// stream via `create_stream_on_append`, and is otherwise ignored.
@@ -42,41 +39,6 @@ impl Backend {
         )
         .await
     }
-
-    /// Open a stream for an append session.
-    ///
-    /// Unlike [`Backend::open_for_append`], a missing stream is not created here even if the basin
-    /// has `create_stream_on_append` enabled, since the `create_stream_config` to apply is carried
-    /// by the first message, which clients only send once they have the response headers. In that
-    /// case [`AppendSessionOpen::Deferred`] is returned and the caller is expected to complete
-    /// stream creation with [`Backend::open_for_append`] once the first message is available.
-    pub async fn open_for_append_session(
-        &self,
-        basin: &BasinName,
-        stream: &StreamName,
-        encryption_key: Option<EncryptionKey>,
-    ) -> Result<AppendSessionOpen, AppendError> {
-        match self
-            .lookup_stream_for_auto_create::<AppendError>(basin, stream, AutoCreateOn::Append)
-            .await?
-        {
-            StreamLookup::Found(client) => Ok(AppendSessionOpen::Ready(
-                self.stream_handle::<AppendError>(client, |cipher| {
-                    Ok(EncryptionSpec::resolve(cipher, encryption_key)?)
-                })?,
-            )),
-            StreamLookup::AutoCreate => Ok(AppendSessionOpen::Deferred),
-        }
-    }
-}
-
-/// Outcome of [`Backend::open_for_append_session`].
-pub enum AppendSessionOpen {
-    /// The stream exists.
-    Ready(StreamHandle),
-    /// The stream does not exist and the basin has `create_stream_on_append` enabled.
-    /// Creation is deferred until the first message so its `create_stream_config` can be applied.
-    Deferred,
 }
 
 impl StreamHandle {

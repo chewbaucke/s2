@@ -19,13 +19,11 @@ use s2_common::{
     http::extract::Header,
     read_extent::{CountOrBytes, ReadLimit},
     record::{Metered, MeteredSize as _},
-    stream::{
-        AppendMessage, ReadBatch, ReadEnd, ReadFrom, ReadSessionOutput, ReadStart, StreamName,
-    },
+    stream::{ReadBatch, ReadEnd, ReadFrom, ReadSessionOutput, ReadStart, StreamName},
 };
 
 use crate::{
-    backend::{AppendSessionOpen, Backend, error::ReadError},
+    backend::{Backend, error::ReadError},
     handlers::v1::error::ServiceError,
 };
 
@@ -366,6 +364,7 @@ pub struct AppendArgs {
         v1t::StreamNamePathSegment,
         s2_api::data::S2FormatHeader,
         s2_api::data::S2EncryptionKeyHeader,
+        s2_api::data::S2CreateStreamConfigHeader,
     ),
     servers(
         (url = super::paths::cloud_endpoints::BASIN, variables(
@@ -386,11 +385,8 @@ pub async fn append(
     match request {
         v1t::stream::AppendRequest::Unary {
             encryption_key,
-            message:
-                AppendMessage {
-                    input,
-                    create_stream_config,
-                },
+            create_stream_config,
+            input,
             response_mime,
         } => {
             let handle = backend
@@ -410,71 +406,35 @@ pub async fn append(
         }
         v1t::stream::AppendRequest::S2s {
             encryption_key,
-            messages,
+            create_stream_config,
+            inputs,
             response_compression,
         } => {
-            // Stream existence (and whether it may be auto-created) is checked before responding,
-            // so a missing stream still fails with an HTTP status. Creation itself is deferred
-            // into the response stream: clients wait for the response headers before sending the
-            // first frame, which carries the `create_stream_config` to apply.
-            let open = backend
-                .open_for_append_session(&basin, &stream, encryption_key.clone())
+            let handle = backend
+                .open_for_append(&basin, &stream, encryption_key, create_stream_config)
                 .await?;
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
-            let ack_stream = async_stream::stream! {
-                let mut messages = messages.peekable();
-                let handle = match open {
-                    AppendSessionOpen::Ready(handle) => handle,
-                    AppendSessionOpen::Deferred => {
-                        let create_stream_config = match std::pin::Pin::new(&mut messages).peek().await {
-                            Some(Ok(message)) => message.create_stream_config.clone(),
-                            Some(Err(_)) => {
-                                // Don't create the stream off an undecodable first message.
-                                if let Some(Err(e)) = messages.next().await {
-                                    yield Err(ServiceError::from(e));
-                                }
-                                return;
+            let inputs = async_stream::stream! {
+                tokio::pin!(inputs);
+                let mut err_tx = Some(err_tx);
+                while let Some(input) = inputs.next().await {
+                    match input {
+                        Ok(input) => yield input,
+                        Err(e) => {
+                            if let Some(tx) = err_tx.take() {
+                                let _ = tx.send(e);
                             }
-                            // Nothing was sent, so there is nothing to create.
-                            None => return,
-                        };
-                        match backend
-                            .open_for_append(&basin, &stream, encryption_key, create_stream_config)
-                            .await
-                        {
-                            Ok(handle) => handle,
-                            Err(e) => {
-                                yield Err(ServiceError::from(e));
-                                return;
-                            }
+                            break;
                         }
                     }
-                };
-
-                let inputs = async_stream::stream! {
-                    let mut err_tx = Some(err_tx);
-                    while let Some(message) = messages.next().await {
-                        match message {
-                            Ok(AppendMessage { input, .. }) => yield input,
-                            Err(e) => {
-                                if let Some(tx) = err_tx.take() {
-                                    let _ = tx.send(e);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                };
-
-                let acks = handle.append_session(inputs);
-                let mut acks = std::pin::pin!(acks);
-                while let Some(res) = acks.next().await {
-                    yield res
-                        .map(v1t::stream::proto::AppendAck::from)
-                        .map_err(ServiceError::from);
                 }
             };
+
+            let ack_stream = handle.append_session(inputs).map(|res| {
+                res.map(v1t::stream::proto::AppendAck::from)
+                    .map_err(ServiceError::from)
+            });
 
             let input_err_stream = futures::stream::once(err_rx).filter_map(|res| async move {
                 match res {
@@ -512,9 +472,12 @@ mod tests {
     use bytesize::ByteSize;
     use futures::TryStreamExt as _;
     use prost::Message as _;
-    use s2_api::v1::stream::{
-        proto,
-        s2s::{self, FrameDecoder, SessionMessage},
+    use s2_api::v1::{
+        config::CREATE_STREAM_CONFIG_HEADER,
+        stream::{
+            proto,
+            s2s::{self, FrameDecoder, SessionMessage},
+        },
     };
     use s2_common::{
         basin::{BASIN_HEADER, BasinName},
@@ -726,7 +689,6 @@ mod tests {
             }],
             match_seq_num: None,
             fencing_token: None,
-            create_stream_config: None,
         };
 
         let response = send(
@@ -808,34 +770,38 @@ mod tests {
         }
     }
 
-    fn proto_create_stream_config() -> proto::StreamConfig {
-        proto::StreamConfig {
-            storage_class: None,
-            retention_policy: Some(proto::stream_config::RetentionPolicy::Age(3600)),
-            timestamping: None,
-            delete_on_empty: Some(proto::DeleteOnEmptyConfig { min_age_secs: 300 }),
+    const CREATE_STREAM_CONFIG_HEADER_VALUE: &str =
+        r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#;
+
+    fn append_record_input(body: &'static [u8]) -> proto::AppendInput {
+        proto::AppendInput {
+            records: vec![proto::AppendRecord {
+                timestamp: None,
+                headers: vec![],
+                body: Bytes::from_static(body),
+            }],
+            match_seq_num: None,
+            fencing_token: None,
         }
     }
 
     #[tokio::test]
-    async fn json_append_auto_creates_stream_with_create_stream_config() {
+    async fn json_append_auto_creates_stream_with_create_stream_config_header() {
         let (app, backend, basin, stream) = setup_app_without_stream(
             "append-json-create-config",
             basin_config_with_create_stream_on_append(),
         )
         .await;
 
-        let body = serde_json::json!({
-            "records": [{"body": "hello"}],
-            "create_stream_config": {
-                "retention_policy": {"age": 3600},
-                "delete_on_empty": {"min_age_secs": 300}
-            }
-        });
+        let body = serde_json::json!({"records": [{"body": "hello"}]});
         let response = send(
             &app,
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    CREATE_STREAM_CONFIG_HEADER.as_str(),
+                    CREATE_STREAM_CONFIG_HEADER_VALUE,
+                )
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -852,40 +818,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_append_with_invalid_create_stream_config_is_rejected_without_creating() {
+    async fn append_with_invalid_create_stream_config_header_is_rejected_without_creating() {
         let (app, backend, basin, stream) = setup_app_without_stream(
-            "append-json-create-config-invalid",
+            "append-create-config-invalid",
             basin_config_with_create_stream_on_append(),
         )
         .await;
 
-        let body = serde_json::json!({
-            "records": [{"body": "hello"}],
-            "create_stream_config": {"retention_policy": {"age": 0}}
-        });
-        let response = send(
-            &app,
-            request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await;
+        for (value, expected_message) in [
+            (
+                r#"{"retention_policy":{"age":0}}"#,
+                "age must be greater than 0 seconds",
+            ),
+            ("not json", "invalid JSON"),
+        ] {
+            let body = serde_json::json!({"records": [{"body": "hello"}]});
+            let response = send(
+                &app,
+                request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(CREATE_STREAM_CONFIG_HEADER.as_str(), value)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let info = response_json(response, "append error body").await;
-        assert_eq!(info["code"], "invalid");
-        assert!(
-            info["message"]
-                .as_str()
-                .expect("error message string")
-                .contains("age must be greater than 0 seconds")
-        );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let info = response_json(response, "append error body").await;
+            assert_eq!(info["code"], "bad_header");
+            let message = info["message"].as_str().expect("error message string");
+            assert!(
+                message.contains("s2-create-stream-config") && message.contains(expected_message),
+                "{message}"
+            );
+        }
         assert_no_streams(&backend, &basin).await;
     }
 
     #[tokio::test]
-    async fn proto_append_ignores_create_stream_config_for_existing_stream() {
+    async fn proto_append_ignores_create_stream_config_header_for_existing_stream() {
         let (app, backend, basin, stream) = setup_app_with_config(
             "append-proto-create-config-existing",
             basin_config_with_create_stream_on_append(),
@@ -897,22 +868,16 @@ mod tests {
             .await
             .expect("get stream config");
 
-        let input = proto::AppendInput {
-            records: vec![proto::AppendRecord {
-                timestamp: None,
-                headers: vec![],
-                body: Bytes::from_static(b"hello"),
-            }],
-            match_seq_num: None,
-            fencing_token: None,
-            create_stream_config: Some(proto_create_stream_config()),
-        };
         let response = send(
             &app,
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "application/protobuf")
                 .header(header::ACCEPT, "application/protobuf")
-                .body(Body::from(input.encode_to_vec()))
+                .header(
+                    CREATE_STREAM_CONFIG_HEADER.as_str(),
+                    CREATE_STREAM_CONFIG_HEADER_VALUE,
+                )
+                .body(Body::from(append_record_input(b"hello").encode_to_vec()))
                 .unwrap(),
         )
         .await;
@@ -927,44 +892,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s2s_append_session_auto_creates_stream_with_first_frame_config() {
+    async fn s2s_append_session_auto_creates_stream_with_create_stream_config_header() {
         let (app, backend, basin, stream) = setup_app_without_stream(
             "append-s2s-create-config",
             basin_config_with_create_stream_on_append(),
         )
         .await;
 
-        let frame = |body: &'static [u8], create_stream_config| {
-            let input = proto::AppendInput {
-                records: vec![proto::AppendRecord {
-                    timestamp: None,
-                    headers: vec![],
-                    body: Bytes::from_static(body),
-                }],
-                match_seq_num: None,
-                fencing_token: None,
-                create_stream_config,
-            };
-            SessionMessage::regular(s2s::CompressionAlgorithm::None, &input)
+        let frame = |body: &'static [u8]| {
+            SessionMessage::regular(s2s::CompressionAlgorithm::None, &append_record_input(body))
                 .expect("encode frame")
                 .encode()
         };
-        // Only the first frame's config is applied; the second frame's conflicting
-        // config is ignored since the stream exists by then.
-        let conflicting = proto::StreamConfig {
-            retention_policy: Some(proto::stream_config::RetentionPolicy::Infinite(
-                proto::stream_config::InfiniteRetention {},
-            )),
-            ..Default::default()
-        };
         let mut body = BytesMut::new();
-        body.extend_from_slice(&frame(b"first", Some(proto_create_stream_config())));
-        body.extend_from_slice(&frame(b"second", Some(conflicting)));
+        body.extend_from_slice(&frame(b"first"));
+        body.extend_from_slice(&frame(b"second"));
 
         let response = send(
             &app,
             request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                 .header(header::CONTENT_TYPE, "s2s/proto")
+                .header(
+                    CREATE_STREAM_CONFIG_HEADER.as_str(),
+                    CREATE_STREAM_CONFIG_HEADER_VALUE,
+                )
                 .body(Body::from(body.freeze()))
                 .unwrap(),
         )
@@ -995,11 +946,11 @@ mod tests {
     }
 
     /// Clients only start sending frames once they have the response headers, so auto-creation
-    /// must not block the response on the first frame.
+    /// must complete (or fail) before the response, never waiting on the body.
     #[tokio::test]
-    async fn s2s_append_session_responds_before_first_frame_when_auto_creating() {
+    async fn s2s_append_session_auto_creates_before_first_frame() {
         let (app, backend, basin, stream) = setup_app_without_stream(
-            "append-s2s-create-deferred",
+            "append-s2s-create-eager",
             basin_config_with_create_stream_on_append(),
         )
         .await;
@@ -1012,6 +963,10 @@ mod tests {
                 &app,
                 request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
                     .header(header::CONTENT_TYPE, "s2s/proto")
+                    .header(
+                        CREATE_STREAM_CONFIG_HEADER.as_str(),
+                        CREATE_STREAM_CONFIG_HEADER_VALUE,
+                    )
                     .body(Body::from_stream(frames_rx))
                     .unwrap(),
             ),
@@ -1019,23 +974,17 @@ mod tests {
         .await
         .expect("response headers must not wait for the first frame");
         assert_eq!(response.status(), StatusCode::OK);
-        // Nothing has been sent yet, so nothing should have been created.
-        assert_no_streams(&backend, &basin).await;
+        // The header is all that is needed, so the stream already exists with the config.
+        let config = backend
+            .get_stream_config(basin.clone(), stream.clone())
+            .await
+            .expect("get stream config");
+        assert_eq!(config, expected_auto_created_config());
 
-        let input = proto::AppendInput {
-            records: vec![proto::AppendRecord {
-                timestamp: None,
-                headers: vec![],
-                body: Bytes::from_static(b"first"),
-            }],
-            match_seq_num: None,
-            fencing_token: None,
-            create_stream_config: Some(proto_create_stream_config()),
-        };
         frames_tx
             .unbounded_send(Ok(SessionMessage::regular(
                 s2s::CompressionAlgorithm::None,
-                &input,
+                &append_record_input(b"first"),
             )
             .expect("encode frame")
             .encode()))
@@ -1050,34 +999,6 @@ mod tests {
             .try_into_proto::<proto::AppendAck>()
             .expect("decode append ack");
         assert_eq!(ack.end.as_ref().map(|pos| pos.seq_num), Some(1));
-
-        let config = backend
-            .get_stream_config(basin, stream)
-            .await
-            .expect("get stream config");
-        assert_eq!(config, expected_auto_created_config());
-    }
-
-    #[tokio::test]
-    async fn s2s_append_session_without_frames_does_not_auto_create_stream() {
-        let (app, backend, basin, stream) = setup_app_without_stream(
-            "append-s2s-create-empty",
-            basin_config_with_create_stream_on_append(),
-        )
-        .await;
-
-        let response = send(
-            &app,
-            request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
-                .header(header::CONTENT_TYPE, "s2s/proto")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_bytes(response, "s2s body").await;
-        assert!(body.is_empty());
-        assert_no_streams(&backend, &basin).await;
     }
 
     #[tokio::test]

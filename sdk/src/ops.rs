@@ -3,7 +3,7 @@ use crate::client::Connect;
 use crate::{
     api::{AccountClient, BaseClient, BasinClient},
     producer::{Producer, ProducerConfig},
-    session::{self, AppendSession, AppendSessionConfig, ReadSession},
+    session::{self, AppendHeaders, AppendSession, AppendSessionConfig, ReadSession},
     types::{
         AccessTokenId, AccessTokenInfo, AppendAck, AppendInput, BasinConfig, BasinInfo, BasinName,
         CreateBasinInput, CreateStreamInput, DeleteBasinInput, DeleteStreamInput, EncryptionKey,
@@ -294,6 +294,7 @@ impl S2Basin {
             client: self.client.clone(),
             name,
             encryption: None,
+            create_stream_config: None,
         }
     }
 
@@ -416,6 +417,7 @@ pub struct S2Stream {
     client: BasinClient,
     name: StreamName,
     encryption: Option<EncryptionKey>,
+    create_stream_config: Option<StreamConfig>,
 }
 
 impl S2Stream {
@@ -424,6 +426,30 @@ impl S2Stream {
         Self {
             encryption: Some(encryption),
             ..self
+        }
+    }
+
+    /// Set the stream configuration to apply if an append from this handle creates the stream.
+    ///
+    /// Sent as the `s2-create-stream-config` header on appends and append sessions. Only takes
+    /// effect when the basin has `create_stream_on_append` enabled and the stream does not exist
+    /// yet; unset fields inherit the basin's default stream configuration. Ignored if the stream
+    /// exists.
+    pub fn with_create_stream_config(self, create_stream_config: StreamConfig) -> Self {
+        Self {
+            create_stream_config: Some(create_stream_config),
+            ..self
+        }
+    }
+
+    fn api_create_stream_config(&self) -> Option<s2_api::v1::config::StreamConfig> {
+        self.create_stream_config.clone().map(Into::into)
+    }
+
+    fn append_headers(&self) -> AppendHeaders {
+        AppendHeaders {
+            encryption: self.encryption.clone(),
+            create_stream_config: self.api_create_stream_config(),
         }
     }
 
@@ -441,6 +467,7 @@ impl S2Stream {
                 &self.name,
                 input.into(),
                 self.encryption.as_ref(),
+                self.api_create_stream_config().as_ref(),
                 self.client.config.retry.append_retry_policy,
             )
             .await?;
@@ -470,7 +497,7 @@ impl S2Stream {
         AppendSession::new(
             self.client.clone(),
             self.name.clone(),
-            self.encryption.clone(),
+            self.append_headers(),
             config,
         )
     }
@@ -480,7 +507,7 @@ impl S2Stream {
         Producer::new(
             self.client.clone(),
             self.name.clone(),
-            self.encryption.clone(),
+            self.append_headers(),
             config,
         )
     }

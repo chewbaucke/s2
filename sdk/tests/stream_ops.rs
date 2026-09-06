@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use common::{S2Stream, SharedS2Basin, s2_config, unique_basin_name, unique_stream_name};
+use common::{S2Stream, SharedS2Basin, s2, s2_config, unique_basin_name, unique_stream_name};
 use futures_util::StreamExt;
 use rstest::rstest;
 use s2_sdk::{
@@ -1952,5 +1952,90 @@ async fn producer_for_non_existent_stream_errors(basin: &SharedS2Basin) -> Resul
         });
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_stream_config_applies_only_when_append_creates_stream() -> Result<(), S2Error> {
+    let s2 = s2();
+    let basin_name = unique_basin_name();
+    s2.create_basin(
+        CreateBasinInput::new(basin_name.clone()).with_config(
+            BasinConfig::new()
+                .with_create_stream_on_append(true)
+                .with_default_stream_config(
+                    StreamConfig::new().with_storage_class(StorageClass::Standard),
+                ),
+        ),
+    )
+    .await?;
+    let basin = s2.basin(basin_name.clone());
+
+    let create_stream_config = StreamConfig::new()
+        .with_retention_policy(RetentionPolicy::Age(3600))
+        .with_delete_on_empty(DeleteOnEmptyConfig::new().with_min_age(Duration::from_secs(300)));
+
+    // Unary append creates the stream with the header config layered over basin defaults.
+    let unary_stream = unique_stream_name();
+    basin
+        .stream(unary_stream.clone())
+        .with_create_stream_config(create_stream_config.clone())
+        .append(AppendInput::new(AppendRecordBatch::try_from_iter([
+            AppendRecord::new("hello")?,
+        ])?))
+        .await?;
+    let config = basin.get_stream_config(unary_stream).await?;
+    assert_matches!(
+        config,
+        StreamConfig {
+            storage_class: Some(StorageClass::Standard),
+            retention_policy: Some(RetentionPolicy::Age(3600)),
+            delete_on_empty: Some(DeleteOnEmptyConfig {
+                min_age_secs: 300,
+                ..
+            }),
+            ..
+        }
+    );
+
+    // Append sessions (via the producer) send the same header.
+    let session_stream = unique_stream_name();
+    let producer = basin
+        .stream(session_stream.clone())
+        .with_create_stream_config(create_stream_config.clone())
+        .producer(ProducerConfig::default());
+    producer.submit(AppendRecord::new("hello")?).await?.await?;
+    producer.close().await?;
+    let config = basin.get_stream_config(session_stream).await?;
+    assert_matches!(
+        config,
+        StreamConfig {
+            retention_policy: Some(RetentionPolicy::Age(3600)),
+            delete_on_empty: Some(DeleteOnEmptyConfig {
+                min_age_secs: 300,
+                ..
+            }),
+            ..
+        }
+    );
+
+    // Ignored once the stream exists.
+    let existing_stream = unique_stream_name();
+    basin
+        .create_stream(CreateStreamInput::new(existing_stream.clone()))
+        .await?;
+    let before = basin.get_stream_config(existing_stream.clone()).await?;
+    basin
+        .stream(existing_stream.clone())
+        .with_create_stream_config(create_stream_config)
+        .append(AppendInput::new(AppendRecordBatch::try_from_iter([
+            AppendRecord::new("hello")?,
+        ])?))
+        .await?;
+    let after = basin.get_stream_config(existing_stream).await?;
+    assert_eq!(after, before);
+    assert_ne!(after.retention_policy, Some(RetentionPolicy::Age(3600)));
+
+    s2.delete_basin(DeleteBasinInput::new(basin_name)).await?;
     Ok(())
 }

@@ -17,7 +17,7 @@ use crate::{
         extract::{JsonExtractionRejection, ProtoRejection},
     },
     mime::JsonOrProto,
-    v1::stream::sse::LastEventId,
+    v1::{config::CreateStreamConfigHeader, stream::sse::LastEventId},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +54,9 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let content_type = crate::mime::content_type(req.headers());
         let encryption_key = parse_header_opt::<EncryptionKey>(req.headers())?;
+        let create_stream_config = parse_header_opt::<CreateStreamConfigHeader>(req.headers())?
+            .map(|header| header.0)
+            .unwrap_or_default();
 
         if content_type.as_ref().is_some_and(crate::mime::is_s2s_proto) {
             let response_compression =
@@ -74,8 +77,8 @@ where
                 match msg? {
                     s2s::SessionMessage::Regular(data) => {
                         let input = data.try_into_proto::<proto::AppendInput>()?;
-                        let message = s2_common::stream::AppendMessage::try_from(input)?;
-                        Ok(Some((message, framed)))
+                        let input = s2_common::stream::AppendInput::try_from(input)?;
+                        Ok(Some((input, framed)))
                     }
                     s2s::SessionMessage::Terminal(_) => {
                         Err(AppendInputStreamError::FrameDecode(std::io::Error::new(
@@ -88,7 +91,8 @@ where
 
             return Ok(Self::S2s {
                 encryption_key,
-                messages: Box::pin(inputs),
+                create_stream_config,
+                inputs: Box::pin(inputs),
                 response_compression,
             });
         }
@@ -103,7 +107,7 @@ where
             .and_then(JsonOrProto::from_mime)
             .unwrap_or(JsonOrProto::Json);
 
-        let message = match request_mime {
+        let input = match request_mime {
             JsonOrProto::Proto => {
                 let Proto(input) = Proto::<proto::AppendInput>::from_request(req, state).await?;
                 input.try_into()?
@@ -117,7 +121,8 @@ where
 
         Ok(Self::Unary {
             encryption_key,
-            message,
+            create_stream_config,
+            input,
             response_mime,
         })
     }

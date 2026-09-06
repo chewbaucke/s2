@@ -16,8 +16,6 @@ mod kv;
 
 pub use core::Backend;
 
-pub use append::AppendSessionOpen;
-
 pub use crate::stream_id::StreamId;
 
 pub struct StreamHandle {

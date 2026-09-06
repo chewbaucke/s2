@@ -18,7 +18,10 @@ use s2_api::v1::{
     basin::{
         BasinInfo, CreateBasinRequest, EnsureBasinRequest, ListBasinsRequest, ListBasinsResponse,
     },
-    config::{BasinConfig, BasinReconfiguration, StreamConfig, StreamReconfiguration},
+    config::{
+        BasinConfig, BasinReconfiguration, CREATE_STREAM_CONFIG_HEADER, CreateStreamConfigHeader,
+        StreamConfig, StreamReconfiguration,
+    },
     location::LocationInfo,
     metrics::{
         AccountMetricSetRequest, BasinMetricSetRequest, MetricSetResponse, StreamMetricSetRequest,
@@ -382,6 +385,7 @@ impl BasinClient {
         name: &StreamName,
         input: AppendInput,
         encryption: Option<&EncryptionKey>,
+        create_stream_config: Option<&StreamConfig>,
         append_retry_policy: AppendRetryPolicy,
     ) -> Result<AppendAck, ApiError> {
         let url = self.uri(format!("v1/streams/{}/records", urlencoding::encode(name)));
@@ -392,6 +396,7 @@ impl BasinClient {
             .body(input.encode_to_vec())
             .build()?;
         set_encryption_header(&mut request, encryption);
+        set_create_stream_config_header(&mut request, create_stream_config);
         let response = self
             .request(request)
             .with_append_retry_policy(append_retry_policy)
@@ -444,6 +449,7 @@ impl BasinClient {
         name: &StreamName,
         inputs: I,
         encryption: Option<&EncryptionKey>,
+        create_stream_config: Option<&StreamConfig>,
         frame_signal: Option<FrameSignal>,
     ) -> Result<Streaming<AppendAck>, ApiError>
     where
@@ -473,6 +479,7 @@ impl BasinClient {
             add_basin_header_if_required(request_builder, &self.config.endpoints, &self.name);
         let mut request = request_builder.build()?;
         set_encryption_header(&mut request, encryption);
+        set_create_stream_config_header(&mut request, create_stream_config);
         let response = self
             .client
             .init_streaming(request)
@@ -950,6 +957,18 @@ fn set_encryption_header(request: &mut client::Request, encryption: Option<&Encr
         request.headers_mut().insert(
             S2_ENCRYPTION_KEY_HEADER.clone(),
             encryption.to_header_value(),
+        );
+    }
+}
+
+fn set_create_stream_config_header(
+    request: &mut client::Request,
+    create_stream_config: Option<&StreamConfig>,
+) {
+    if let Some(config) = create_stream_config {
+        request.headers_mut().insert(
+            CREATE_STREAM_CONFIG_HEADER.clone(),
+            CreateStreamConfigHeader::to_header_value(config),
         );
     }
 }

@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
-use s2_common::maybe::Maybe;
+use http::{HeaderName, HeaderValue};
+use s2_common::{http::ParseableHeader, maybe::Maybe};
 use serde::{Deserialize, Serialize};
 
 #[rustfmt::skip]
@@ -348,6 +349,41 @@ impl From<s2_common::config::StreamConfig> for StreamConfig {
             timestamping: Some(timestamping.into()),
             delete_on_empty: Some(delete_on_empty.into()),
         }
+    }
+}
+
+pub static CREATE_STREAM_CONFIG_HEADER: HeaderName =
+    HeaderName::from_static("s2-create-stream-config");
+
+/// Value of the `s2-create-stream-config` header: a JSON-encoded [`StreamConfig`] to apply if the
+/// request creates the stream on demand.
+///
+/// Parsing validates the config the same way `CreateStream` does. Only the JSON object form is
+/// accepted, and it must be a single header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateStreamConfigHeader(pub s2_common::config::OptionalStreamConfig);
+
+impl CreateStreamConfigHeader {
+    /// Encode a [`StreamConfig`] as a compact JSON header value.
+    pub fn to_header_value(config: &StreamConfig) -> HeaderValue {
+        let json = serde_json::to_string(config).expect("StreamConfig serializes to JSON");
+        HeaderValue::from_str(&json).expect("compact JSON of StreamConfig is a valid header value")
+    }
+}
+
+impl FromStr for CreateStreamConfigHeader {
+    type Err = s2_common::ValidationError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: StreamConfig = serde_json::from_str(s)
+            .map_err(|e| s2_common::ValidationError(format!("invalid JSON: {e}")))?;
+        Ok(Self(config.try_into()?))
+    }
+}
+
+impl ParseableHeader for CreateStreamConfigHeader {
+    fn name() -> &'static HeaderName {
+        &CREATE_STREAM_CONFIG_HEADER
     }
 }
 
@@ -1055,6 +1091,61 @@ mod tests {
         assert!(
             internal.delete_on_empty.min_age.is_none(),
             "delete_on_empty.min_age should be None"
+        );
+    }
+
+    #[test]
+    fn create_stream_config_header_parses_and_validates() {
+        let header: CreateStreamConfigHeader =
+            r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#
+                .parse()
+                .unwrap();
+        assert_eq!(
+            header.0,
+            s2_common::config::OptionalStreamConfig {
+                retention_policy: Some(s2_common::config::RetentionPolicy::Age(
+                    Duration::from_secs(3600)
+                )),
+                delete_on_empty: s2_common::config::OptionalDeleteOnEmptyConfig {
+                    min_age: Some(Duration::from_secs(300)),
+                },
+                ..Default::default()
+            }
+        );
+
+        let empty: CreateStreamConfigHeader = "{}".parse().unwrap();
+        assert_eq!(empty.0, Default::default());
+
+        let invalid_json = "not json".parse::<CreateStreamConfigHeader>().unwrap_err();
+        assert!(invalid_json.to_string().contains("invalid JSON"));
+
+        // Same validation as CreateStream.
+        let invalid_age =
+            r#"{"retention_policy":{"age":0}}"#.parse::<CreateStreamConfigHeader>().unwrap_err();
+        assert!(
+            invalid_age
+                .to_string()
+                .contains("age must be greater than 0 seconds"),
+            "{invalid_age}"
+        );
+    }
+
+    #[test]
+    fn create_stream_config_header_value_roundtrips() {
+        let config = StreamConfig {
+            storage_class: Some(StorageClass::Express),
+            retention_policy: Some(RetentionPolicy::Infinite(InfiniteRetention {})),
+            timestamping: Some(TimestampingConfig {
+                mode: Some(TimestampingMode::ClientRequire),
+                uncapped: Some(true),
+            }),
+            delete_on_empty: Some(DeleteOnEmptyConfig { min_age_secs: 60 }),
+        };
+        let value = CreateStreamConfigHeader::to_header_value(&config);
+        let parsed: CreateStreamConfigHeader = value.to_str().unwrap().parse().unwrap();
+        assert_eq!(
+            parsed.0,
+            s2_common::config::OptionalStreamConfig::try_from(config).unwrap()
         );
     }
 }

@@ -100,6 +100,23 @@ pub struct S2FormatHeader {
 #[derive(Debug)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
 #[cfg_attr(feature = "utoipa", into_params(parameter_in = Header))]
+pub struct S2CreateStreamConfigHeader {
+    /// Stream configuration to apply if this request creates the stream via the basin's `create_stream_on_append` setting,
+    /// encoded as compact JSON in the shape of `StreamConfig`. Unset fields inherit the basin's `default_stream_config`.
+    /// Ignored if the stream already exists.
+    #[cfg_attr(feature = "utoipa", param(
+        required = false,
+        rename = "s2-create-stream-config",
+        value_type = String,
+        example = json!(r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#),
+    ))]
+    pub s2_create_stream_config: String,
+}
+
+#[rustfmt::skip]
+#[derive(Debug)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "utoipa", into_params(parameter_in = Header))]
 pub struct S2EncryptionKeyHeader {
     /// Encryption key material for append and read operations.
     /// Provide base64-encoded key when stream encryption is enabled.
@@ -401,7 +418,6 @@ pub mod extract {
                 records: vec![],
                 match_seq_num: None,
                 fencing_token: None,
-                create_stream_config: None,
             });
             assert_roundtrip(&AppendInput {
                 records: vec![AppendRecord {
@@ -411,14 +427,6 @@ pub mod extract {
                 }],
                 match_seq_num: Some(42),
                 fencing_token: Some("token".parse().unwrap()),
-                create_stream_config: Some(crate::v1::config::StreamConfig {
-                    storage_class: None,
-                    retention_policy: Some(crate::v1::config::RetentionPolicy::Age(3600)),
-                    timestamping: None,
-                    delete_on_empty: Some(crate::v1::config::DeleteOnEmptyConfig {
-                        min_age_secs: 300,
-                    }),
-                }),
             });
 
             // StreamReconfiguration: exercises Maybe<T> in all three states
