@@ -12,7 +12,7 @@ use s2_sdk::{
     producer::ProducerConfig,
     types::{
         AppendInput, AppendRecord, AppendRecordBatch, BasinName, ReadFrom, ReadInput, ReadLimits,
-        ReadStart, ReadStop, S2Config, StreamName,
+        ReadSessionConfig, ReadStart, ReadStop, S2Config, StreamName,
     },
 };
 
@@ -94,6 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Submit individual records
     let ticket = producer.submit(AppendRecord::new("my event")?).await?;
 
+    // Force the partial batch and wait for durability without closing the producer
+    producer.flush().await?;
+
     // Get the exact sequence number
     let ack = ticket.await?;
     println!("Record durable at seqNum {}", ack.seq_num);
@@ -121,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ANCHOR: read-session
     let mut session = stream
-        .read_session(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0))))
+        .read_session(
+            ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0))),
+            ReadSessionConfig::default(),
+        )
         .await?;
 
     while let Some(batch) = session.next().await {
@@ -137,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = stream
         .read_session(
             ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::TailOffset(10))),
+            ReadSessionConfig::default(),
         )
         .await?;
 
@@ -158,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .read_session(
             ReadInput::new()
                 .with_start(ReadStart::new().with_from(ReadFrom::Timestamp(one_hour_ago))),
+            ReadSessionConfig::default(),
         )
         .await?;
 
@@ -180,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ReadInput::new()
                 .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0)))
                 .with_stop(ReadStop::new().with_until(..one_hour_ago)),
+            ReadSessionConfig::default(),
         )
         .await?;
 
@@ -199,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ReadInput::new()
                 .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0)))
                 .with_stop(ReadStop::new().with_wait(30)),
+            ReadSessionConfig::default(),
         )
         .await?;
 

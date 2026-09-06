@@ -17,10 +17,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rand::{Rng, SeedableRng};
 use s2_sdk::{
     S2Stream,
+    error::ProducerError,
     producer::{IndexedAppendAck, ProducerConfig},
     types::{
-        AppendRecord, Header, MeteredBytes as _, RECORD_BATCH_MAX, ReadFrom, ReadInput, ReadStart,
-        ReadStop, S2Error, SequencedRecord,
+        AppendRecord, Header, MeteredBytes as _, RECORD_BATCH_MAX, ReadFrom, ReadInput,
+        ReadSessionConfig, ReadStart, ReadStop, SequencedRecord,
     },
 };
 use tokio::{
@@ -46,7 +47,7 @@ const LATENCY_TABLE_SIDE_BY_SIDE_WIDTH: usize =
     LATENCY_TABLE_COLUMN_WIDTH * 2 + LATENCY_TABLE_GAP.len();
 
 type PendingAck =
-    Pin<Box<dyn Future<Output = (Instant, Result<IndexedAppendAck, S2Error>)> + Send>>;
+    Pin<Box<dyn Future<Output = (Instant, Result<IndexedAppendAck, ProducerError>)> + Send>>;
 
 pub struct BenchWriteSample {
     pub bytes: u64,
@@ -556,7 +557,7 @@ fn bench_read_inner(
             .with_start(ReadStart::new().with_from(ReadFrom::SeqNum(0)))
             .with_stop(stop);
         let mut read_session = stream
-            .read_session(read_input)
+            .read_session(read_input, ReadSessionConfig::default())
             .await
             .map_err(|e| CliError::op(OpKind::Bench, e))?;
 

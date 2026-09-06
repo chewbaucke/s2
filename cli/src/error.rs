@@ -1,6 +1,8 @@
 use miette::Diagnostic;
-use s2_api::v1::error::ErrorCode;
-use s2_sdk::types::S2Error;
+use s2_sdk::error::{
+    AppendError, AppendSessionError, ErrorCode, ProducerError, ReadError, ReadSessionError,
+    RequestError, ServerError,
+};
 use thiserror::Error;
 
 const HELP: &str = color_print::cstr!(
@@ -17,6 +19,39 @@ const BUG_HELP: &str = color_print::cstr!(
      <bold>https://github.com/s2-streamstore/s2/issues</bold>
 "
 );
+
+#[derive(Error, Debug)]
+pub enum SdkError {
+    #[error(transparent)]
+    Request(#[from] RequestError),
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    #[error(transparent)]
+    Append(#[from] AppendError),
+    #[error(transparent)]
+    AppendSession(#[from] AppendSessionError),
+    #[error(transparent)]
+    ReadSession(#[from] ReadSessionError),
+    #[error(transparent)]
+    Producer(#[from] ProducerError),
+}
+
+impl SdkError {
+    fn request_error(&self) -> Option<&RequestError> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Read(error) => error.request_error(),
+            Self::Append(error) => error.request_error(),
+            Self::AppendSession(error) => error.request_error(),
+            Self::ReadSession(error) => error.request_error(),
+            Self::Producer(error) => error.request_error(),
+        }
+    }
+
+    fn server_error(&self) -> Option<&ServerError> {
+        self.request_error().and_then(RequestError::server_error)
+    }
+}
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum CliError {
@@ -39,15 +74,15 @@ pub enum CliError {
 
     #[error("Failed to initialize S2 SDK")]
     #[diagnostic(help("{}", HELP))]
-    SdkInit(#[source] S2Error),
+    SdkInit(#[source] SdkError),
 
     #[error("Failed to initialize S2 SDK")]
     #[diagnostic(help(
         "Token loaded from {1}. Verify it does not contain invalid characters.\n\
-         Update it with `s2 config set access_token <token>` or set `S2_ACCESS_TOKEN`.\n\n{}",
+         Store one with `s2 auth access-token set`, or set `S2_ACCESS_TOKEN`.\n\n{}",
         HELP
     ))]
-    MalformedAccessToken(#[source] S2Error, TokenSource),
+    MalformedAccessToken(#[source] SdkError, TokenSource),
 
     #[error(transparent)]
     #[diagnostic(help("{}", BUG_HELP))]
@@ -67,18 +102,22 @@ pub enum CliError {
 
     #[error("{}: {}", .0, .1)]
     #[diagnostic(help("{}", HELP))]
-    Operation(OpKind, #[source] S2Error),
+    Operation(OpKind, #[source] SdkError),
 
     #[error("{}: {}", .0, .1)]
     #[diagnostic(help(
         "Verify the token loaded from {2} is valid and has permission for this operation, then retry.\n\
-         Update it with `s2 config set access_token <token>` or set `S2_ACCESS_TOKEN`."
+         Store one with `s2 auth access-token set`, or set `S2_ACCESS_TOKEN`."
     ))]
-    UnauthorizedAccessToken(OpKind, #[source] S2Error, TokenSource),
+    UnauthorizedAccessToken(OpKind, #[source] SdkError, TokenSource),
 
     #[error("S2 Lite server error: {0}")]
     #[diagnostic(help("{}", HELP))]
     LiteServer(String),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Login(#[from] crate::login::LoginError),
 
     #[error("Apply failed: {0}")]
     #[diagnostic(help("{}", HELP))]
@@ -86,6 +125,10 @@ pub enum CliError {
 
     #[error("Access token '{0}' not found")]
     AccessTokenNotFound(String),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    AccessToken(#[from] crate::access_token::AccessTokenError),
 
     #[error("Invalid configuration returned by S2: {0}")]
     #[diagnostic(help("{}", BUG_HELP))]
@@ -100,8 +143,8 @@ pub enum CliError {
 }
 
 impl CliError {
-    pub fn op(kind: OpKind, source: S2Error) -> Self {
-        Self::Operation(kind, source)
+    pub fn op<E: Into<SdkError>>(kind: OpKind, source: E) -> Self {
+        Self::Operation(kind, source.into())
     }
 
     pub fn with_token_source(self, token_source: Option<TokenSource>) -> Self {
@@ -110,7 +153,7 @@ impl CliError {
                 CliError::UnauthorizedAccessToken(kind, source, token_source)
             }
             (CliError::SdkInit(source), Some(token_source))
-                if matches!(source, S2Error::MalformedAccessToken(_)) =>
+                if is_malformed_access_token(&source) =>
             {
                 CliError::MalformedAccessToken(source, token_source)
             }
@@ -178,6 +221,8 @@ pub enum S2UriParseError {
 #[derive(Debug, Clone, Copy)]
 pub enum TokenSource {
     Environment,
+    BrowserLogin,
+    StoredAccessToken,
     ConfigFile,
 }
 
@@ -185,23 +230,24 @@ impl std::fmt::Display for TokenSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TokenSource::Environment => write!(f, "environment (S2_ACCESS_TOKEN)"),
+            TokenSource::BrowserLogin => write!(f, "browser login"),
+            TokenSource::StoredAccessToken => write!(f, "stored access token"),
             TokenSource::ConfigFile => write!(f, "config file"),
         }
     }
 }
 
-fn is_auth_error(err: &S2Error) -> bool {
-    match err {
-        S2Error::Server(response) => is_auth_error_code(&response.code),
-        _ => false,
-    }
+fn is_auth_error(err: &SdkError) -> bool {
+    err.server_error()
+        .and_then(ServerError::known_code)
+        .is_some_and(ErrorCode::is_auth_error)
 }
 
-fn is_auth_error_code(code: &str) -> bool {
-    match code.parse::<ErrorCode>() {
-        Ok(code) => code.is_auth_error(),
-        Err(_) => false,
-    }
+fn is_malformed_access_token(err: &SdkError) -> bool {
+    matches!(
+        err.request_error(),
+        Some(RequestError::MalformedAccessToken(_))
+    )
 }
 
 #[cfg(test)]
@@ -255,12 +301,18 @@ pub enum CliConfigError {
 
     #[error("Failed to load config file")]
     #[diagnostic(help(
-        "Did you run `s2 config set access_token <token>`? or use `S2_ACCESS_TOKEN` environment variable."
+        "Run `s2 auth access-token set`, or set the `S2_ACCESS_TOKEN` environment variable."
     ))]
-    Load(#[from] config::ConfigError),
+    Load,
 
     #[error("Failed to write config file")]
     Write(#[source] std::io::Error),
+
+    #[error("Failed to acquire the config lock")]
+    Lock(#[source] std::io::Error),
+
+    #[error("Timed out waiting for another S2 process to update the config")]
+    LockTimedOut,
 
     #[error("Failed to serialize config")]
     Serialize(#[source] toml::ser::Error),
@@ -268,9 +320,45 @@ pub enum CliConfigError {
     #[error("Invalid value '{1}' for config key '{0}'")]
     InvalidValue(String, String),
 
+    #[error("Access tokens are managed separately from ordinary configuration")]
+    #[diagnostic(help(
+        "Use `s2 auth access-token set` to store a token, or `s2 auth access-token remove` to forget it."
+    ))]
+    CredentialManagedSeparately,
+
+    #[error("Stored access tokens cannot be read through `s2 config get`")]
+    #[diagnostic(help(
+        "Use the token's source of truth if it must be exported. The CLI intentionally does not print stored credentials."
+    ))]
+    CredentialNotReadable,
+
     #[error("Missing access token")]
     #[diagnostic(help(
-        "Run `s2 config set access_token <token>` or set the `S2_ACCESS_TOKEN` environment variable."
+        "Run `s2 login`, `s2 auth access-token set`, or set the `S2_ACCESS_TOKEN` environment variable."
     ))]
     MissingAccessToken,
+
+    #[error("S2_ACCESS_TOKEN is not valid Unicode")]
+    #[diagnostic(help("Set S2_ACCESS_TOKEN to a valid access token and retry."))]
+    InvalidAccessTokenEnvironment,
+
+    #[error("{0} is not valid Unicode")]
+    InvalidEnvironmentValue(&'static str),
+
+    #[error("No access token is configured")]
+    #[diagnostic(help(
+        "Run `s2 auth access-token set` before selecting `s2 auth use access-token`."
+    ))]
+    StoredAccessTokenNotConfigured,
+
+    #[error("No browser login is configured")]
+    #[diagnostic(help("Run `s2 login` before selecting `s2 auth use browser-login`."))]
+    BrowserLoginNotConfigured,
+}
+
+impl From<config::ConfigError> for CliConfigError {
+    fn from(_error: config::ConfigError) -> Self {
+        // Parser errors can include source excerpts containing a legacy plaintext token.
+        Self::Load
+    }
 }

@@ -25,9 +25,29 @@
 [s2.dev](https://s2.dev) is a serverless datastore for real-time, streaming data.
 
 This repository contains:
-- **[s2-cli](cli/)** - The official S2 command-line interface
-- **[s2-lite](lite/)** - An open source, self-hostable server implementation of the [S2 API](https://s2.dev/docs/api)
-- **[s2-sdk](sdk/)** - The official Rust SDK for S2
+- **[s2-cli](cli/)** - Command-line interface for S2
+- **[s2-lite](lite/)** - Open source, self-hostable server implementation of the [S2 API](https://s2.dev/docs/api)
+- **[s2-sdk](sdk/)** - Rust SDK for S2
+
+## Development
+
+Use the nightly Cargo dependency commands so that the repository publication cooldown applies:
+
+```bash
+cargo +nightly add <crate>
+cargo +nightly update
+cargo +nightly update -p <crate>
+cargo +nightly remove <crate>
+cargo +nightly generate-lockfile
+```
+
+Use `--locked` with normal build, check, test, run, document, fetch, and metadata commands. The simulator is temporarily exempt until its separate lockfile is regenerated. The pull request dependency check verifies every proposed lock-file change before Rust build jobs start.
+
+Install the repository Cargo tools from Homebrew bottles:
+
+```bash
+brew install cargo-deny cargo-nextest
+```
 
 ## Installation
 
@@ -51,6 +71,32 @@ Or specify a version with `VERSION=x.y.z` before the command. See all [releases]
 ```bash
 docker pull ghcr.io/s2-streamstore/s2
 ```
+
+## Authentication
+
+Store an access token in the OS credential store:
+
+```bash
+s2 auth access-token set
+```
+
+Or pipe it in from a script or a secret manager:
+
+```bash
+op read 'op://S2/CLI/access-token' | s2 auth access-token set --stdin
+```
+
+For CI and other ephemeral environments, set `S2_ACCESS_TOKEN` in the environment. On a headless host with no credential store, opt into a private plaintext file instead (mode `0600` on Unix):
+
+```bash
+printf '%s' "$S2_ACCESS_TOKEN" |
+  s2 auth access-token set --stdin --insecure-storage
+unset S2_ACCESS_TOKEN
+```
+
+Plaintext `access_token` values in `config.toml` are deprecated.
+Migrate one with `s2 auth access-token migrate`, or re-store it with `--insecure-storage` on a
+headless host that has no credential store.
 
 ## s2-lite
 

@@ -19,38 +19,95 @@ use tracing::debug;
 
 use crate::{
     api::{ApiError, BasinClient, retry_builder},
+    error::{ReadError, RequestError},
+    reconnect::{AdvisedReconnects, ReconnectAdvice},
     retry::RetryBackoff,
-    types::{EncryptionKey, MeteredBytes, ReadBatch, S2Error, StreamName, StreamPosition},
+    types::{
+        AccessTokenMode, EncryptionKey, MeteredBytes, ReadBatch, ReadInput, ReadSessionConfig,
+        ReadSessionRetryPolicy, StreamName, StreamPosition,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
-pub enum ReadSessionError {
+enum ReadSessionFailure {
     #[error(transparent)]
     Api(#[from] ApiError),
     #[error("heartbeat timeout")]
     HeartbeatTimeout,
 }
 
-impl ReadSessionError {
+impl ReadSessionFailure {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Api(err) => err.is_retryable(),
             Self::HeartbeatTimeout => true,
         }
     }
+
+    fn is_authentication_error(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_authentication_error())
+    }
+
+    fn is_server_draining(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_server_draining())
+    }
 }
 
-impl From<ReadSessionError> for S2Error {
-    fn from(err: ReadSessionError) -> Self {
-        match err {
-            ReadSessionError::Api(api_err) => api_err.into(),
-            other => S2Error::Client(other.to_string()),
+/// Errors returned by a read session.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReadSessionError {
+    /// An error with the read request underlying the session.
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    /// The session heartbeat timed out.
+    #[error("heartbeat timeout")]
+    HeartbeatTimeout,
+}
+
+impl ReadSessionError {
+    /// Whether retrying the operation is safe or sensible.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Read(error) => error.is_retryable(),
+            Self::HeartbeatTimeout => true,
+        }
+    }
+
+    /// Return the underlying request error, if present.
+    pub fn request_error(&self) -> Option<&RequestError> {
+        match self {
+            Self::Read(error) => error.request_error(),
+            Self::HeartbeatTimeout => None,
         }
     }
 }
 
-pub type Streaming<R> =
-    Pin<Box<dyn Send + futures_core::Stream<Item = Result<R, ReadSessionError>>>>;
+impl From<ReadSessionFailure> for ReadSessionError {
+    fn from(error: ReadSessionFailure) -> Self {
+        match error {
+            ReadSessionFailure::Api(error) => Self::Read(error.into()),
+            ReadSessionFailure::HeartbeatTimeout => Self::HeartbeatTimeout,
+        }
+    }
+}
+
+/// The server heartbeats a tailing read session at a randomized gap of at most
+/// 15 seconds (<https://s2.dev/docs/api/protocol#data-flow>), plus some buffer.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type InternalStreaming<R> =
+    Pin<Box<dyn Send + futures_core::Stream<Item = Result<R, ReadSessionFailure>>>>;
+
+/// An item from a single read connection.
+enum ReadItem {
+    Batch(ReadBatch),
+    /// The server advised reconnecting and the response ended cleanly.
+    ///
+    /// Always the last item of a connection, emitted after the batch it rode
+    /// in on, so the resume position already accounts for that batch.
+    ReconnectAdvised,
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -61,16 +118,23 @@ pub enum CaughtUpError {
     SessionClosed,
     #[error(transparent)]
     /// The read failed.
-    Read(#[from] S2Error),
+    Read(#[from] ReadSessionError),
 }
 
-impl From<CaughtUpError> for S2Error {
-    fn from(err: CaughtUpError) -> Self {
-        match err {
-            CaughtUpError::SessionClosed => {
-                Self::Client("read session ended before catching up".into())
-            }
-            CaughtUpError::Read(err) => err,
+impl CaughtUpError {
+    /// Whether retrying the operation is safe or sensible.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::SessionClosed => false,
+            Self::Read(error) => error.is_retryable(),
+        }
+    }
+
+    /// Return the underlying request error, if present.
+    pub fn request_error(&self) -> Option<&RequestError> {
+        match self {
+            Self::SessionClosed => None,
+            Self::Read(error) => error.request_error(),
         }
     }
 }
@@ -145,7 +209,7 @@ impl CaughtUpState {
         self.complete(Ok(tail));
     }
 
-    fn end(&mut self, error: Option<S2Error>) {
+    fn end(&mut self, error: Option<ReadSessionError>) {
         if self.terminal {
             return;
         }
@@ -175,6 +239,7 @@ fn pending_catch_up() -> (oneshot::Sender<CaughtUpResult>, CaughtUpFuture) {
 struct ReadUpdate {
     batch: Option<ReadBatch>,
     caught_up_tail: Option<StreamPosition>,
+    resume_seq_num: Option<u64>,
 }
 
 impl ReadUpdate {
@@ -182,10 +247,12 @@ impl ReadUpdate {
         Self {
             batch: None,
             caught_up_tail: None,
+            resume_seq_num: None,
         }
     }
 
     fn from_batch(mut batch: ReadBatch, ignore_command_records: bool) -> Self {
+        let resume_seq_num = resume_seq_num_after_batch(&batch);
         let caught_up_tail = batch.tail.filter(|tail| {
             batch.records.is_empty()
                 || batch
@@ -201,22 +268,36 @@ impl ReadUpdate {
         Self {
             batch: (!batch.records.is_empty()).then_some(batch),
             caught_up_tail,
+            resume_seq_num,
         }
     }
 }
 
 /// A continuous stream of read batches.
 pub struct ReadSession {
-    updates: Streaming<ReadUpdate>,
+    updates: InternalStreaming<ReadUpdate>,
     state: CaughtUpState,
+    resume_seq_num: Option<u64>,
 }
 
 impl ReadSession {
-    fn new(updates: Streaming<ReadUpdate>) -> Self {
+    fn new(updates: InternalStreaming<ReadUpdate>, resume_seq_num: Option<u64>) -> Self {
         Self {
             updates,
             state: CaughtUpState::new(),
+            resume_seq_num,
         }
+    }
+
+    /// Return the absolute sequence number from which the session would resume after a retry.
+    ///
+    /// An unclamped absolute starting sequence number is available immediately. A timestamp,
+    /// tail-relative, or clamped start returns `None` until the session receives a record or a
+    /// reported tail. The returned value is the sequence number of the next record the session
+    /// expects. It advances as the session is polled, including across records hidden by
+    /// [`ReadInput::ignore_command_records`](crate::types::ReadInput::ignore_command_records).
+    pub fn resume_seq_num(&self) -> Option<u64> {
+        self.resume_seq_num
     }
 
     /// Return whether all records through the latest reported tail were delivered.
@@ -248,13 +329,16 @@ impl ReadSession {
 }
 
 impl futures_core::Stream for ReadSession {
-    type Item = Result<ReadBatch, S2Error>;
+    type Item = Result<ReadBatch, ReadSessionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match self.updates.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(update))) => {
+                    if let Some(resume_seq_num) = update.resume_seq_num {
+                        self.resume_seq_num = Some(resume_seq_num);
+                    }
                     if let Some(tail) = update.caught_up_tail {
                         self.state.set_caught_up(tail);
                     } else {
@@ -265,7 +349,7 @@ impl futures_core::Stream for ReadSession {
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    let error = S2Error::from(error);
+                    let error = ReadSessionError::from(error);
                     self.state.end(Some(error.clone()));
                     return Poll::Ready(Some(Err(error)));
                 }
@@ -288,13 +372,27 @@ pub async fn read_session(
     client: BasinClient,
     name: StreamName,
     encryption: Option<EncryptionKey>,
-    mut start: ReadStart,
-    mut end: ReadEnd,
-    ignore_command_records: bool,
+    input: ReadInput,
+    config: ReadSessionConfig,
 ) -> Result<ReadSession, ReadSessionError> {
+    let ReadInput {
+        start,
+        stop,
+        ignore_command_records,
+    } = input;
+    let mut start: ReadStart = start.into();
+    let mut end: ReadEnd = stop.into();
+    let retry_policy = config.retry_policy;
     let mut retry_backoff = retry_builder(&client.config.retry).build();
+    let access_token_mode = client.config.access_token.mode();
     let baseline_wait = end.wait;
     let mut last_tail_at: Option<Instant> = None;
+    let mut advised_reconnects = AdvisedReconnects::default();
+    let initial_resume_seq_num = if start.clamp == Some(true) {
+        None
+    } else {
+        start.seq_num
+    };
 
     let batches = loop {
         end.wait = remaining_wait(baseline_wait, last_tail_at);
@@ -304,6 +402,8 @@ pub async fn read_session(
             encryption.clone(),
             start.clone(),
             end.clone(),
+            ReconnectAdvice::default(),
+            advised_reconnects,
         )
         .await
         {
@@ -312,17 +412,26 @@ pub async fn read_session(
                 break batches;
             }
             Err(err) => {
-                if let Some(backoff) = retry_delay(&err, &mut retry_backoff) {
+                if take_server_draining_reconnect(&err, &mut advised_reconnects) {
+                    debug!(
+                        advised_reconnects = advised_reconnects.count(),
+                        "reconnecting initial read session while server drains"
+                    );
+                    continue;
+                }
+                if let Some(backoff) =
+                    retry_delay(&err, &mut retry_backoff, retry_policy, access_token_mode)
+                {
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
-                return Err(err);
+                return Err(err.into());
             }
         }
     };
 
     let updates = Box::pin(stream! {
-        let mut batches: Option<Streaming<ReadBatch>> = Some(batches);
+        let mut batches: Option<InternalStreaming<ReadItem>> = Some(batches);
 
         loop {
             if batches.is_none() {
@@ -333,10 +442,27 @@ pub async fn read_session(
                     encryption.clone(),
                     start.clone(),
                     end.clone(),
+                    ReconnectAdvice::default(),
+                    advised_reconnects,
                 ).await {
                     Ok(b) => batches = Some(b),
                     Err(err) => {
-                        if let Some(backoff) = retry_delay(&err, &mut retry_backoff) {
+                        if take_server_draining_reconnect(&err, &mut advised_reconnects) {
+                            debug!(
+                                resume_seq_num = ?start.seq_num,
+                                advised_reconnects = advised_reconnects.count(),
+                                "reconnecting read session while server drains"
+                            );
+                            continue;
+                        }
+                        if let Some(backoff) =
+                            retry_delay(
+                                &err,
+                                &mut retry_backoff,
+                                retry_policy,
+                                access_token_mode,
+                            )
+                        {
                             tokio::time::sleep(backoff).await;
                             continue;
                         }
@@ -352,7 +478,25 @@ pub async fn read_session(
                 .next()
                 .await
             {
-                Some(Ok(batch)) => {
+                Some(Ok(ReadItem::ReconnectAdvised)) => {
+                    batches = None;
+                    // The advised connection was already poisoned when the
+                    // advice was first decoded; reconnecting dials a fresh
+                    // one. Avoid a useless reconnect for a read that was
+                    // already satisfied when the advice arrived.
+                    if read_limits_exhausted(&end) {
+                        break;
+                    }
+                    advised_reconnects.record();
+                    debug!(
+                        resume_seq_num = ?start.seq_num,
+                        advised_reconnects = advised_reconnects.count(),
+                        "reconnecting read session on server advice"
+                    );
+                    yield Ok(ReadUpdate::behind());
+                    continue;
+                }
+                Some(Ok(ReadItem::Batch(batch))) => {
                     if retry_backoff.used() > 0 {
                         retry_backoff.reset();
                     }
@@ -361,14 +505,7 @@ pub async fn read_session(
                         last_tail_at = Some(Instant::now());
                     }
 
-                    if let Some(record) = batch.records.last() {
-                        start = ReadStart {
-                            seq_num: Some(record.seq_num + 1),
-                            timestamp: None,
-                            tail_offset: None,
-                            clamp: start.clamp,
-                        };
-                    }
+                    update_resume_start(&mut start, &batch);
                     if let Some(count) = end.count.as_mut() {
                         *count = count.saturating_sub(batch.records.len())
                     }
@@ -382,7 +519,26 @@ pub async fn read_session(
                 }
                 Some(Err(err)) => {
                     batches = None;
-                    if let Some(backoff) = retry_delay(&err, &mut retry_backoff) {
+                    if err.is_server_draining() && read_limits_exhausted(&end) {
+                        break;
+                    }
+                    if take_server_draining_reconnect(&err, &mut advised_reconnects) {
+                        debug!(
+                            resume_seq_num = ?start.seq_num,
+                            advised_reconnects = advised_reconnects.count(),
+                            "reconnecting read session while server drains"
+                        );
+                        yield Ok(ReadUpdate::behind());
+                        continue;
+                    }
+                    if let Some(backoff) =
+                        retry_delay(
+                            &err,
+                            &mut retry_backoff,
+                            retry_policy,
+                            access_token_mode,
+                        )
+                    {
                         yield Ok(ReadUpdate::behind());
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -394,7 +550,30 @@ pub async fn read_session(
             }
         }
     });
-    Ok(ReadSession::new(updates))
+    Ok(ReadSession::new(updates, initial_resume_seq_num))
+}
+
+fn resume_seq_num_after_batch(batch: &ReadBatch) -> Option<u64> {
+    batch
+        .records
+        .last()
+        .map(|record| record.seq_num + 1)
+        .or_else(|| batch.tail.as_ref().map(|tail| tail.seq_num))
+}
+
+/// Advance the absolute start used when reconnecting the read session.
+///
+/// An empty batch with a reported tail still resolves a relative or timestamp start. Anchoring it
+/// prevents a reconnect from evaluating the original start against a newer tail.
+fn update_resume_start(start: &mut ReadStart, batch: &ReadBatch) {
+    if let Some(seq_num) = resume_seq_num_after_batch(batch) {
+        *start = ReadStart {
+            seq_num: Some(seq_num),
+            timestamp: None,
+            tail_offset: None,
+            clamp: start.clamp,
+        };
+    }
 }
 
 async fn session_inner(
@@ -403,21 +582,37 @@ async fn session_inner(
     encryption: Option<EncryptionKey>,
     start: ReadStart,
     end: ReadEnd,
-) -> Result<Streaming<ReadBatch>, ReadSessionError> {
+    reconnect: ReconnectAdvice,
+    advised_reconnects: AdvisedReconnects,
+) -> Result<InternalStreaming<ReadItem>, ReadSessionFailure> {
     let mut batches = client
-        .read_session(&name, start, end, encryption.as_ref())
+        .read_session(&name, start, end, encryption.as_ref(), reconnect.clone())
         .await?;
+
+    let mut declined_advice = false;
     Ok(Box::pin(try_stream! {
         loop {
-            match timeout(Duration::from_secs(20), batches.next()).await {
+            match timeout(HEARTBEAT_TIMEOUT, batches.next()).await {
                 Ok(Some(batch)) => {
-                    yield ReadBatch::from_api(batch?);
+                    yield ReadItem::Batch(ReadBatch::from_api(batch?));
+                    if reconnect.is_advised() && !declined_advice {
+                        if advised_reconnects.should_reconnect() {
+                            yield ReadItem::ReconnectAdvised;
+                            break;
+                        }
+                        declined_advice = true;
+                    }
                 }
                 Ok(None) => break,
-                Err(_) => Err(ReadSessionError::HeartbeatTimeout)?,
+                Err(_) => Err(ReadSessionFailure::HeartbeatTimeout)?,
             }
         }
     }))
+}
+
+/// Whether the read's `count` or `bytes` limit has been used up.
+fn read_limits_exhausted(end: &ReadEnd) -> bool {
+    end.count == Some(0) || end.bytes == Some(0)
 }
 
 /// Compute the remaining wait budget for a retry.
@@ -433,13 +628,33 @@ fn remaining_wait(baseline_wait: Option<u32>, last_tail_at: Option<Instant>) -> 
     })
 }
 
-fn retry_delay(err: &ReadSessionError, backoffs: &mut RetryBackoff) -> Option<Duration> {
-    if err.is_retryable()
-        && let Some(backoff) = backoffs.next()
-    {
+fn retry_delay(
+    err: &ReadSessionFailure,
+    backoffs: &mut RetryBackoff,
+    retry_policy: ReadSessionRetryPolicy,
+    access_token_mode: AccessTokenMode,
+) -> Option<Duration> {
+    let is_retryable =
+        err.is_retryable() || (access_token_mode.is_refreshable() && err.is_authentication_error());
+    if !is_retryable {
+        debug!(
+            %err,
+            is_retryable = false,
+            retries_exhausted = backoffs.is_exhausted(),
+            "not retrying read session"
+        );
+        return None;
+    }
+
+    let backoff = match retry_policy {
+        ReadSessionRetryPolicy::Budgeted => backoffs.next(),
+        ReadSessionRetryPolicy::Indefinite => Some(backoffs.next_or_max()),
+    };
+    if let Some(backoff) = backoff {
         debug!(
             %err,
             ?backoff,
+            ?retry_policy,
             num_retries_remaining = backoffs.remaining(),
             "retrying read session"
         );
@@ -447,11 +662,23 @@ fn retry_delay(err: &ReadSessionError, backoffs: &mut RetryBackoff) -> Option<Du
     } else {
         debug!(
             %err,
-            is_retryable = err.is_retryable(),
+            is_retryable,
             retries_exhausted = backoffs.is_exhausted(),
             "not retrying read session"
         );
         None
+    }
+}
+
+fn take_server_draining_reconnect(
+    err: &ReadSessionFailure,
+    advised_reconnects: &mut AdvisedReconnects,
+) -> bool {
+    if err.is_server_draining() {
+        advised_reconnects.record();
+        true
+    } else {
+        false
     }
 }
 
@@ -489,10 +716,48 @@ mod tests {
         ReadBatch { records, tail }
     }
 
+    #[test]
+    fn empty_tail_anchors_relative_resume_start() {
+        let mut start = ReadStart {
+            seq_num: None,
+            timestamp: None,
+            tail_offset: Some(0),
+            clamp: Some(true),
+        };
+
+        update_resume_start(&mut start, &batch(Vec::new(), Some(position(42))));
+
+        assert_eq!(start.seq_num, Some(42));
+        assert_eq!(start.timestamp, None);
+        assert_eq!(start.tail_offset, None);
+        assert_eq!(start.clamp, Some(true));
+    }
+
     fn test_session(
-        updates: impl futures_core::Stream<Item = Result<ReadUpdate, ReadSessionError>> + Send + 'static,
+        updates: impl futures_core::Stream<Item = Result<ReadUpdate, ReadSessionFailure>>
+        + Send
+        + 'static,
     ) -> ReadSession {
-        ReadSession::new(Box::pin(updates))
+        ReadSession::new(Box::pin(updates), None)
+    }
+
+    #[tokio::test]
+    async fn empty_tail_exposes_absolute_resume_seq_num() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut session = test_session(UnboundedReceiverStream::new(rx));
+
+        assert_eq!(session.resume_seq_num(), None);
+        tx.send(Ok(ReadUpdate::from_batch(
+            batch(Vec::new(), Some(position(42))),
+            false,
+        )))
+        .unwrap();
+
+        let mut next = Box::pin(session.next());
+        assert!(poll!(next.as_mut()).is_pending());
+        drop(next);
+
+        assert_eq!(session.resume_seq_num(), Some(42));
     }
 
     #[tokio::test]
@@ -517,10 +782,12 @@ mod tests {
         let first = session.next().await.unwrap().unwrap();
         assert_eq!(first.records.len(), 2);
         assert!(session.is_caught_up());
+        assert_eq!(session.resume_seq_num(), Some(2));
         let caught_up_while_caught = session.caught_up();
 
         session.next().await.unwrap().unwrap();
         assert!(!session.is_caught_up());
+        assert_eq!(session.resume_seq_num(), Some(3));
         assert_eq!(caught_up.await.unwrap(), tail);
         assert_eq!(caught_up_while_caught.await.unwrap(), tail);
     }
@@ -607,6 +874,7 @@ mod tests {
 
         assert!(session.next().await.is_none());
         assert!(session.is_caught_up());
+        assert_eq!(session.resume_seq_num(), Some(2));
         assert_eq!(caught_up.await.unwrap(), tail);
     }
 
@@ -656,15 +924,14 @@ mod tests {
 
     #[tokio::test]
     async fn read_error_rejects_wait() {
-        let mut session = test_session(stream::iter([Err(ReadSessionError::HeartbeatTimeout)]));
+        let mut session = test_session(stream::iter([Err(ReadSessionFailure::HeartbeatTimeout)]));
         let caught_up = session.caught_up();
 
         let error = session.next().await.unwrap().unwrap_err();
         assert_eq!(error.to_string(), "heartbeat timeout");
         assert!(matches!(
             caught_up.await,
-            Err(CaughtUpError::Read(S2Error::Client(message)))
-                if message == "heartbeat timeout"
+            Err(CaughtUpError::Read(ReadSessionError::HeartbeatTimeout))
         ));
     }
 
@@ -676,7 +943,7 @@ mod tests {
                 batch(vec![record(0, false)], Some(tail)),
                 false,
             )),
-            Err(ReadSessionError::HeartbeatTimeout),
+            Err(ReadSessionFailure::HeartbeatTimeout),
         ]));
 
         session.next().await.unwrap().unwrap();
@@ -688,8 +955,7 @@ mod tests {
         assert_eq!(caught_up.await.unwrap(), tail);
         assert!(matches!(
             session.caught_up().await,
-            Err(CaughtUpError::Read(S2Error::Client(message)))
-                if message == "heartbeat timeout"
+            Err(CaughtUpError::Read(ReadSessionError::HeartbeatTimeout))
         ));
     }
 

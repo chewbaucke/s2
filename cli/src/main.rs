@@ -1,12 +1,16 @@
 //! S2 command-line interface.
 
+mod access_token;
 mod apply;
+mod auth;
 mod bench;
 mod cli;
 mod config;
+mod credential_store;
 mod diff;
 mod error;
 mod lite;
+mod login;
 mod ops;
 mod record_format;
 mod types;
@@ -19,10 +23,13 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::{pin::Pin, process::ExitCode, time::Duration};
 
 use clap::{CommandFactory, Parser};
-use cli::{ApplyArgs, Cli, Command, ConfigCommand, ListBasinsArgs, ListStreamsArgs};
+use cli::{
+    ApplyArgs, AuthAccessTokenCommand, AuthCommand, Cli, Command, ConfigCommand, ListBasinsArgs,
+    ListStreamsArgs,
+};
 use colored::Colorize;
 use config::{
-    ConfigKey, access_token_source, load_cli_config, load_config_file, sdk_config,
+    AuthMethod, ConfigKey, CredentialStore, load_config_file, sdk_config, select_auth_method,
     set_config_value, unset_config_value,
 };
 use error::{CliError, OpKind};
@@ -88,7 +95,117 @@ fn parse_cli() -> Cli {
 }
 
 fn allows_passive_update_check(command: Option<&Command>) -> bool {
-    !matches!(command, Some(Command::Lite(_) | Command::Update(_)))
+    !matches!(
+        command,
+        Some(
+            Command::Lite(_)
+                | Command::Login(_)
+                | Command::Logout(_)
+                | Command::Auth(
+                    AuthCommand::Login(_) | AuthCommand::Logout(_) | AuthCommand::Status,
+                )
+                | Command::Update(_)
+        )
+    )
+}
+
+fn print_legacy_access_token_deprecation(config: &config::CliConfig) {
+    if config.has_legacy_access_token() {
+        eprintln!(
+            "{}",
+            "! `access_token` in config.toml is deprecated.\n  Run `s2 auth access-token migrate` to move it to secure storage."
+                .yellow()
+        );
+    }
+}
+
+fn print_token_change(message: &str, change: &access_token::TokenChange) {
+    eprintln!("{}", format!("✓ {message}").green().bold());
+    if change.replaced {
+        eprintln!("  - Previous access token replaced.");
+    }
+    match change.credential_store {
+        CredentialStore::Keyring => {
+            eprintln!(
+                "  - Access token saved to: {}",
+                "OS credential store".cyan()
+            );
+        }
+        CredentialStore::File => {
+            #[cfg(unix)]
+            eprintln!(
+                "{}",
+                "  - Warning: the access token is stored in a plaintext file with user-only permissions."
+                    .yellow()
+            );
+            #[cfg(not(unix))]
+            eprintln!(
+                "{}",
+                "  - Warning: the access token is stored in a plaintext file using the platform's default user-directory permissions."
+                    .yellow()
+            );
+            if let Some(path) = change.credential_path.as_ref() {
+                eprintln!(
+                    "  - Access token saved to: {}",
+                    path.display().to_string().cyan()
+                );
+            }
+        }
+    }
+    eprintln!(
+        "  - Configuration saved to: {}",
+        change.config_path.display().to_string().cyan()
+    );
+    if let Some(error) = change.cleanup_warning.as_ref() {
+        eprintln!(
+            "{}",
+            format!("  - Warning: an older local credential remains queued for cleanup: {error}")
+                .yellow()
+        );
+    }
+    if config::access_token_from_environment()
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        eprintln!(
+            "{}",
+            "  - Warning: S2_ACCESS_TOKEN is set and remains active. Unset it to use the selected credential."
+                .yellow()
+        );
+    }
+}
+
+fn print_token_removal(removal: access_token::TokenRemoval) {
+    if removal.removed {
+        eprintln!("{}", "✓ Access token removed".green().bold());
+        eprintln!("{}", "  - This does not revoke the access token.".yellow());
+    } else {
+        eprintln!("{}", "✓ No access token to remove".green().bold());
+    }
+    if let Some(path) = removal.config_path {
+        eprintln!(
+            "  - Configuration saved to: {}",
+            path.display().to_string().cyan()
+        );
+    }
+    if let Some(error) = removal.cleanup_warning {
+        eprintln!(
+            "{}",
+            format!("  - Warning: an older local credential remains queued for cleanup: {error}")
+                .yellow()
+        );
+    }
+    if config::access_token_from_environment()
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        eprintln!(
+            "{}",
+            "  - Warning: S2_ACCESS_TOKEN remains set and is still active.".yellow()
+        );
+    }
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -119,10 +236,62 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    if let Command::Login(args) = &command {
+        login::login(args).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Command::Logout(args) = &command {
+        login::logout(args).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Command::Auth(auth_cmd) = &command {
+        match auth_cmd {
+            AuthCommand::Login(args) => login::login(args).await?,
+            AuthCommand::Logout(args) => login::logout(args).await?,
+            AuthCommand::Status => return auth::status().await,
+            AuthCommand::Use { method } => {
+                let saved_path = select_auth_method(*method).await?;
+                let message = match method {
+                    AuthMethod::AccessToken => "✓ Access token selected",
+                    AuthMethod::BrowserLogin => "✓ Browser login selected",
+                };
+                eprintln!("{}", message.green().bold());
+                eprintln!(
+                    "  - Configuration saved to: {}",
+                    saved_path.display().to_string().cyan()
+                );
+                if login::has_access_token_environment_variable() {
+                    eprintln!(
+                        "{}",
+                        "  - Warning: S2_ACCESS_TOKEN is set and remains active. Unset it to use the selected credential."
+                            .yellow()
+                    );
+                }
+            }
+            AuthCommand::AccessToken { command } => match command {
+                AuthAccessTokenCommand::Set(args) => {
+                    let change = access_token::set(args).await?;
+                    print_token_change("Access token saved", &change);
+                }
+                AuthAccessTokenCommand::Migrate(args) => {
+                    let change = access_token::migrate(args).await?;
+                    print_token_change("Legacy access token migrated", &change);
+                }
+                AuthAccessTokenCommand::Remove => {
+                    print_token_removal(access_token::remove().await?);
+                }
+            },
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if let Command::Config(config_cmd) = &command {
         match config_cmd {
             ConfigCommand::List => {
                 let config = load_config_file()?;
+                print_legacy_access_token_deprecation(&config);
                 for k in ConfigKey::VARIANTS {
                     if let Ok(key) = k.parse::<ConfigKey>()
                         && let Some(v) = config.get(key)
@@ -132,26 +301,43 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
             }
             ConfigCommand::Get { key } => {
+                if matches!(key, ConfigKey::AccessToken) {
+                    return Err(error::CliConfigError::CredentialNotReadable.into());
+                }
                 let config = load_config_file()?;
                 if let Some(v) = config.get(*key) {
                     println!("{}", v);
                 }
             }
             ConfigCommand::Set { key, value } => {
-                let saved_path = set_config_value(*key, value.clone())?;
-                eprintln!("{}", format!("✓ {} set", key).green().bold());
-                eprintln!(
-                    "  Configuration saved to: {}",
-                    saved_path.display().to_string().cyan()
-                );
+                if matches!(key, ConfigKey::AccessToken) {
+                    eprintln!(
+                        "{}",
+                        "! `s2 config set access_token` is deprecated.\n  Use `s2 auth access-token set` instead."
+                            .yellow()
+                    );
+                    let change = access_token::set_from_argument(value.clone()).await?;
+                    print_token_change("Access token saved", &change);
+                } else {
+                    let saved_path = set_config_value(*key, value.clone()).await?;
+                    eprintln!("{}", format!("✓ {} set", key).green().bold());
+                    eprintln!(
+                        "  Configuration saved to: {}",
+                        saved_path.display().to_string().cyan()
+                    );
+                }
             }
             ConfigCommand::Unset { key } => {
-                let saved_path = unset_config_value(*key)?;
-                eprintln!("{}", format!("✓ {} unset", key).green().bold());
-                eprintln!(
-                    "  Configuration saved to: {}",
-                    saved_path.display().to_string().cyan()
-                );
+                if matches!(key, ConfigKey::AccessToken) {
+                    print_token_removal(access_token::remove().await?);
+                } else {
+                    let saved_path = unset_config_value(*key).await?;
+                    eprintln!("{}", format!("✓ {} unset", key).green().bold());
+                    eprintln!(
+                        "  Configuration saved to: {}",
+                        saved_path.display().to_string().cyan()
+                    );
+                }
             }
         }
         return Ok(ExitCode::SUCCESS);
@@ -177,15 +363,28 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         diff::validate_args(args)?;
     }
 
-    let cli_config = load_cli_config()?;
-    let sdk_config = sdk_config(&cli_config, update::user_agent())?;
-    let token_source = access_token_source(&cli_config);
+    let (cli_config, credential) = login::resolve_access_token().await?;
+    print_legacy_access_token_deprecation(&cli_config);
+    credential.validate_destination(&cli_config)?;
+    let sdk_config = credential.configure_sdk(sdk_config(
+        &cli_config,
+        credential.access_token(),
+        update::user_agent(),
+    )?);
+    let token_source = Some(credential.source());
     let s2 = S2::new(sdk_config.clone())
-        .map_err(|e| CliError::SdkInit(e).with_token_source(token_source))?;
+        .map_err(|e| CliError::SdkInit(e.into()).with_token_source(token_source))?;
     let mut exit_code = ExitCode::SUCCESS;
     let result: Result<(), CliError> = (async {
         match command {
-        Command::Config(..) | Command::Lite(..) | Command::Update(..) => unreachable!(),
+        Command::Login(..)
+        | Command::Logout(..)
+        | Command::Auth(..)
+        | Command::Config(..)
+        | Command::Lite(..)
+        | Command::Update(..) => {
+            unreachable!()
+        }
 
         Command::Ls(args) => {
             if let Some(ref uri) = args.uri {
@@ -659,7 +858,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let s2 = S2::new(sdk_config.clone().with_retry(
                 RetryConfig::new().with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
             ))
-            .map_err(CliError::SdkInit)?;
+            .map_err(|e| CliError::SdkInit(e.into()))?;
 
             let basin = s2.basin(basin_name);
             basin

@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "_hidden")]
+use async_trait::async_trait;
 use bytes::Bytes;
 use http::{
     header::HeaderValue,
@@ -65,7 +67,94 @@ use s2_common::{
 };
 use secrecy::SecretString;
 
-use crate::api::{ApiError, ApiErrorResponse};
+use crate::error::RequestError;
+
+#[cfg(feature = "_hidden")]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+#[doc(hidden)]
+pub struct AccessTokenProviderError {
+    message: String,
+    retryable: bool,
+}
+
+#[cfg(feature = "_hidden")]
+impl AccessTokenProviderError {
+    /// Create a provider error that should be retried with normal SDK backoff.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    /// Create a provider error that should be returned immediately.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+#[cfg(feature = "_hidden")]
+#[async_trait]
+#[doc(hidden)]
+pub trait AccessTokenProvider: fmt::Debug + Send + Sync {
+    /// Return an access token for the next request attempt.
+    async fn access_token(&self) -> Result<String, AccessTokenProviderError>;
+
+    /// Notify the provider that S2 rejected an access token.
+    fn invalidate_access_token(&self, _rejected_access_token: &str) {}
+}
+
+#[derive(Clone)]
+pub(crate) enum AccessToken {
+    Static(SecretString),
+    #[cfg(feature = "_hidden")]
+    Provider(Arc<dyn AccessTokenProvider>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessTokenMode {
+    Static,
+    #[cfg(feature = "_hidden")]
+    Refreshable,
+}
+
+impl AccessTokenMode {
+    pub(crate) fn is_refreshable(self) -> bool {
+        match self {
+            Self::Static => false,
+            #[cfg(feature = "_hidden")]
+            Self::Refreshable => true,
+        }
+    }
+}
+
+impl AccessToken {
+    pub(crate) fn mode(&self) -> AccessTokenMode {
+        match self {
+            Self::Static(_) => AccessTokenMode::Static,
+            #[cfg(feature = "_hidden")]
+            Self::Provider(_) => AccessTokenMode::Refreshable,
+        }
+    }
+}
+
+impl fmt::Debug for AccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(_) => formatter.write_str("Static(<redacted>)"),
+            #[cfg(feature = "_hidden")]
+            Self::Provider(_) => formatter.write_str("Provider(<redacted>)"),
+        }
+    }
+}
 
 /// An RFC 3339 datetime.
 ///
@@ -413,7 +502,7 @@ impl RetryConfig {
 #[non_exhaustive]
 /// Configuration for [`S2`](crate::S2).
 pub struct S2Config {
-    pub(crate) access_token: SecretString,
+    pub(crate) access_token: AccessToken,
     pub(crate) endpoints: S2Endpoints,
     pub(crate) connection_timeout: Duration,
     pub(crate) request_timeout: Duration,
@@ -428,7 +517,7 @@ impl S2Config {
     /// Create a new [`S2Config`] with the given access token and default settings.
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
-            access_token: access_token.into().into(),
+            access_token: AccessToken::Static(access_token.into().into()),
             endpoints: S2Endpoints::for_cloud(),
             connection_timeout: Duration::from_secs(3),
             request_timeout: Duration::from_secs(5),
@@ -439,6 +528,15 @@ impl S2Config {
                 .expect("valid user agent"),
             insecure_skip_cert_verification: false,
             rustls_crypto_provider: default_rustls_crypto_provider(),
+        }
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[doc(hidden)]
+    pub fn with_access_token_provider(self, provider: impl AccessTokenProvider + 'static) -> Self {
+        Self {
+            access_token: AccessToken::Provider(Arc::new(provider)),
+            ..self
         }
     }
 
@@ -2840,6 +2938,10 @@ impl ReconfigureStreamInput {
 pub struct FencingToken(String);
 
 impl FencingToken {
+    pub(crate) fn from_server(value: String) -> Self {
+        Self(value)
+    }
+
     /// Generate a random alphanumeric fencing token of `n` bytes.
     pub fn generate(n: usize) -> Result<Self, ValidationError> {
         rand::rng()
@@ -2887,6 +2989,15 @@ pub struct StreamPosition {
     /// Timestamp. When assigned by the service, represents milliseconds since Unix epoch.
     /// User-specified timestamps are passed through as-is.
     pub timestamp: u64,
+}
+
+impl StreamPosition {
+    /// Construct a stream position.
+    ///
+    /// This is intended for building fixtures in downstream tests.
+    pub fn new(seq_num: u64, timestamp: u64) -> Self {
+        Self { seq_num, timestamp }
+    }
 }
 
 impl std::fmt::Display for StreamPosition {
@@ -3307,6 +3418,15 @@ pub struct AppendAck {
     pub tail: StreamPosition,
 }
 
+impl AppendAck {
+    /// Construct an append acknowledgement.
+    ///
+    /// This is intended for building fixtures in downstream tests.
+    pub fn new(start: StreamPosition, end: StreamPosition, tail: StreamPosition) -> Self {
+        Self { start, end, tail }
+    }
+}
+
 impl From<api::stream::proto::AppendAck> for AppendAck {
     fn from(value: api::stream::proto::AppendAck) -> Self {
         Self {
@@ -3507,6 +3627,48 @@ pub struct ReadInput {
     pub ignore_command_records: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[non_exhaustive]
+/// Retry policy for a continuous read session.
+pub enum ReadSessionRetryPolicy {
+    /// Stop after the retry budget configured by [`RetryConfig`] is exhausted.
+    #[default]
+    Budgeted,
+    /// Keep retrying retryable failures after the configured retry budget is exhausted.
+    ///
+    /// This also applies while establishing the initial session, so
+    /// [`read_session`](crate::S2Stream::read_session) may remain pending through retryable
+    /// failures until it connects or the future is cancelled.
+    Indefinite,
+}
+
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+/// Configuration for a continuous read session.
+pub struct ReadSessionConfig {
+    /// Policy for retrying retryable failures.
+    ///
+    /// Clean stream ends and non-retryable failures always terminate the session.
+    ///
+    /// Defaults to [`ReadSessionRetryPolicy::Budgeted`].
+    pub retry_policy: ReadSessionRetryPolicy,
+}
+
+impl ReadSessionConfig {
+    /// Create a new [`ReadSessionConfig`] with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the policy for retrying retryable failures.
+    pub fn with_retry_policy(self, retry_policy: ReadSessionRetryPolicy) -> Self {
+        Self {
+            retry_policy,
+            ..self
+        }
+    }
+}
+
 impl ReadInput {
     /// Create a new [`ReadInput`] with default values.
     pub fn new() -> Self {
@@ -3547,8 +3709,9 @@ pub struct SequencedRecord {
 }
 
 impl SequencedRecord {
-    #[doc(hidden)]
-    #[cfg(feature = "_hidden")]
+    /// Construct a sequenced record from its plain-data fields.
+    ///
+    /// This is intended for building fixtures in downstream tests.
     pub fn from_parts(
         seq_num: u64,
         timestamp: u64,
@@ -3602,6 +3765,13 @@ pub struct ReadBatch {
 }
 
 impl ReadBatch {
+    /// Construct a read batch.
+    ///
+    /// This is intended for building fixtures in downstream tests.
+    pub fn new(records: Vec<SequencedRecord>, tail: Option<StreamPosition>) -> Self {
+        Self { records, tail }
+    }
+
     pub(crate) fn from_api(batch: api::stream::proto::ReadBatch) -> Self {
         Self {
             records: batch.records.into_iter().map(Into::into).collect(),
@@ -3610,91 +3780,8 @@ impl ReadBatch {
     }
 }
 
-/// A [`Stream`](futures_core::Stream) of values of type `Result<T, S2Error>`.
-pub type Streaming<T> = Pin<Box<dyn Send + futures_core::Stream<Item = Result<T, S2Error>>>>;
-
-#[derive(Debug, Clone, thiserror::Error)]
-/// Why an append condition check failed.
-pub enum AppendConditionFailed {
-    #[error("fencing token mismatch, expected: {0}")]
-    /// Fencing token did not match. Contains the expected fencing token.
-    FencingTokenMismatch(FencingToken),
-    #[error("sequence number mismatch, expected: {0}")]
-    /// Sequence number did not match. Contains the expected sequence number.
-    SeqNumMismatch(u64),
-}
-
-impl From<api::stream::AppendConditionFailed> for AppendConditionFailed {
-    fn from(value: api::stream::AppendConditionFailed) -> Self {
-        match value {
-            api::stream::AppendConditionFailed::FencingTokenMismatch(token) => {
-                AppendConditionFailed::FencingTokenMismatch(FencingToken(token.to_string()))
-            }
-            api::stream::AppendConditionFailed::SeqNumMismatch(seq) => {
-                AppendConditionFailed::SeqNumMismatch(seq)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-/// Errors from S2 operations.
-pub enum S2Error {
-    #[error("{0}")]
-    /// Client-side error.
-    Client(String),
-    #[error("malformed access token: {0}")]
-    /// Access token could not be used as an HTTP header value.
-    MalformedAccessToken(String),
-    #[error(transparent)]
-    /// Validation error.
-    Validation(#[from] ValidationError),
-    #[error("{0}")]
-    /// Append condition check failed. Contains the failure reason.
-    AppendConditionFailed(AppendConditionFailed),
-    #[error("read from an unwritten position. current tail: {0}")]
-    /// Read from an unwritten position. Contains the current tail.
-    ReadUnwritten(StreamPosition),
-    #[error("{0}")]
-    /// Other server-side error.
-    Server(ErrorResponse),
-}
-
-impl From<ApiError> for S2Error {
-    fn from(err: ApiError) -> Self {
-        match err {
-            ApiError::ReadUnwritten(tail_response) => {
-                Self::ReadUnwritten(tail_response.tail.into())
-            }
-            ApiError::AppendConditionFailed(condition_failed) => {
-                Self::AppendConditionFailed(condition_failed.into())
-            }
-            ApiError::Server(_, response) => Self::Server(response.into()),
-            ApiError::MalformedAccessToken(err) => Self::MalformedAccessToken(err),
-            other => Self::Client(other.to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{code}: {message}")]
-#[non_exhaustive]
-/// Error response from S2 server.
-pub struct ErrorResponse {
-    /// Error code.
-    pub code: String,
-    /// Error message.
-    pub message: String,
-}
-
-impl From<ApiErrorResponse> for ErrorResponse {
-    fn from(response: ApiErrorResponse) -> Self {
-        Self {
-            code: response.code,
-            message: response.message,
-        }
-    }
-}
+/// A stream of values of type `Result<T, RequestError>`.
+pub type Streaming<T> = Pin<Box<dyn Send + futures_core::Stream<Item = Result<T, RequestError>>>>;
 
 fn idempotency_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -3706,7 +3793,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::api::ClientError;
 
     type HeaderParts = (Vec<u8>, Vec<u8>);
     type AppendRecordParts = (Vec<u8>, Vec<HeaderParts>);
@@ -4373,28 +4459,5 @@ mod tests {
         assert_eq!(record.headers[0].name.as_ref(), b"k");
         assert_eq!(record.headers[0].value.as_ref(), b"v");
         assert_eq!(record.timestamp, 1234);
-    }
-
-    // -- S2Error from ApiError --
-
-    #[test]
-    fn s2_error_from_api_error_client() {
-        let err = ApiError::Client(ClientError::Others("client error".to_owned()));
-        let s2_err: S2Error = err.into();
-        assert!(matches!(s2_err, S2Error::Client(_)));
-    }
-
-    // -- ErrorResponse --
-
-    #[test]
-    fn error_response_from_api() {
-        let api_resp = ApiErrorResponse {
-            code: "not_found".to_string(),
-            message: "basin not found".to_string(),
-        };
-        let resp: ErrorResponse = api_resp.into();
-        assert_eq!(resp.code, "not_found");
-        assert_eq!(resp.message, "basin not found");
-        assert!(resp.to_string().contains("not_found"));
     }
 }

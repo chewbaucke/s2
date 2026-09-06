@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use assert_matches::assert_matches;
 use common::{S2Stream, SharedS2Basin, s2, s2_config, unique_basin_name, unique_stream_name};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, poll};
 use rstest::rstest;
 use s2_sdk::{
     append_session::AppendSessionConfig,
     batching::{BatchLimits, BatchingConfig},
+    error::*,
     producer::ProducerConfig,
     types::*,
 };
@@ -25,7 +26,7 @@ fn past_millis(offset_ms: u64) -> u64 {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn tail_of_new_stream(stream: &S2Stream) -> Result<(), S2Error> {
+async fn tail_of_new_stream(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let tail = stream.check_tail().await?;
 
     assert_eq!(tail.seq_num, 0);
@@ -35,14 +36,16 @@ async fn tail_of_new_stream(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(SharedS2Basin)]
 #[tokio_shared_rt::test(shared)]
-async fn tail_of_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<(), S2Error> {
+async fn tail_of_nonexistent_stream_errors(
+    basin: &SharedS2Basin,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = basin.stream(unique_stream_name());
 
     let result = stream.check_tail().await;
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(ReadError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "stream_not_found");
         }
     );
@@ -52,7 +55,7 @@ async fn tail_of_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<(), 
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn single_append(stream: &S2Stream) -> Result<(), S2Error> {
+async fn single_append(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -68,7 +71,7 @@ async fn single_append(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn multiple_appends(stream: &S2Stream) -> Result<(), S2Error> {
+async fn multiple_appends(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -96,7 +99,7 @@ async fn multiple_appends(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_headers(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_headers(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let headers = vec![Header::new("key1", "value1"), Header::new("key2", "value2")];
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
@@ -117,7 +120,7 @@ async fn append_with_headers(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_match_seq_num(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_match_seq_num(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -144,7 +147,9 @@ async fn append_with_match_seq_num(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_count_limit_partial(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_count_limit_partial(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -175,7 +180,7 @@ async fn read_with_count_limit_partial(stream: &S2Stream) -> Result<(), S2Error>
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_count_limit_exact(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_count_limit_exact(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -205,7 +210,9 @@ async fn read_with_count_limit_exact(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_count_limit_exceeds(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_count_limit_exceeds(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -231,7 +238,9 @@ async fn read_with_count_limit_exceeds(stream: &S2Stream) -> Result<(), S2Error>
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_count_over_max_clamps(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_count_over_max_clamps(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let records = (0..1000)
         .map(|i| AppendRecord::new(format!("record-{i}")))
         .collect::<Result<Vec<_>, _>>()?;
@@ -258,7 +267,9 @@ async fn read_with_count_over_max_clamps(stream: &S2Stream) -> Result<(), S2Erro
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_bytes_limit_partial(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_bytes_limit_partial(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -285,7 +296,7 @@ async fn read_with_bytes_limit_partial(stream: &S2Stream) -> Result<(), S2Error>
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_bytes_limit_exact(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_bytes_limit_exact(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -311,7 +322,9 @@ async fn read_with_bytes_limit_exact(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_bytes_limit_exceeds(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_bytes_limit_exceeds(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -336,7 +349,9 @@ async fn read_with_bytes_limit_exceeds(stream: &S2Stream) -> Result<(), S2Error>
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_bytes_over_max_clamps(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_bytes_over_max_clamps(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let body = "a".repeat(700_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         body.clone(),
@@ -364,7 +379,9 @@ async fn read_with_bytes_over_max_clamps(stream: &S2Stream) -> Result<(), S2Erro
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_seq_num_with_bytes_limit(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_seq_num_with_bytes_limit(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -397,7 +414,7 @@ async fn read_from_seq_num_with_bytes_limit(stream: &S2Stream) -> Result<(), S2E
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_zero_bytes_limit(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_zero_bytes_limit(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -421,7 +438,7 @@ async fn read_with_zero_bytes_limit(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_unbounded_limit(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_unbounded_limit(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -443,7 +460,7 @@ async fn read_with_unbounded_limit(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_empty_body_record(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_empty_body_record(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new("")?])?);
 
     let ack = stream.append(input).await?;
@@ -456,7 +473,9 @@ async fn append_empty_body_record(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_mismatched_seq_num_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_mismatched_seq_num_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -475,7 +494,7 @@ async fn append_with_mismatched_seq_num_errors(stream: &S2Stream) -> Result<(), 
 
     assert_matches!(
         result,
-        Err(S2Error::AppendConditionFailed(
+        Err(AppendError::ConditionFailed(
             AppendConditionFailed::SeqNumMismatch(1)
         ))
     );
@@ -485,7 +504,9 @@ async fn append_with_mismatched_seq_num_errors(stream: &S2Stream) -> Result<(), 
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_session_with_mismatched_seq_num_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_session_with_mismatched_seq_num_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = stream.append_session(AppendSessionConfig::new());
 
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
@@ -506,9 +527,9 @@ async fn append_session_with_mismatched_seq_num_errors(stream: &S2Stream) -> Res
 
     assert_matches!(
         result,
-        Err(S2Error::AppendConditionFailed(
+        Err(AppendSessionError::Append(AppendError::ConditionFailed(
             AppendConditionFailed::SeqNumMismatch(1)
-        ))
+        )))
     );
 
     Ok(())
@@ -516,7 +537,9 @@ async fn append_session_with_mismatched_seq_num_errors(stream: &S2Stream) -> Res
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_matching_fencing_token_succeeds(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_matching_fencing_token_succeeds(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let fencing_token = FencingToken::generate(30).expect("valid fencing token");
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([CommandRecord::fence(
         fencing_token.clone(),
@@ -543,7 +566,9 @@ async fn append_with_matching_fencing_token_succeeds(stream: &S2Stream) -> Resul
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_mismatched_fencing_token_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_mismatched_fencing_token_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let fencing_token_1 = FencingToken::generate(30).expect("valid fencing token");
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([CommandRecord::fence(
         fencing_token_1.clone(),
@@ -565,7 +590,7 @@ async fn append_with_mismatched_fencing_token_errors(stream: &S2Stream) -> Resul
 
     assert_matches!(
         result,
-        Err(S2Error::AppendConditionFailed(AppendConditionFailed::FencingTokenMismatch(fencing_token))) => {
+        Err(AppendError::ConditionFailed(AppendConditionFailed::FencingTokenMismatch(fencing_token))) => {
             assert_eq!(fencing_token, fencing_token_1)
         }
     );
@@ -577,7 +602,7 @@ async fn append_with_mismatched_fencing_token_errors(stream: &S2Stream) -> Resul
 #[tokio_shared_rt::test(shared)]
 async fn append_session_with_mismatched_fencing_token_errors(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = stream.append_session(AppendSessionConfig::new());
 
     let fencing_token_1 = FencingToken::generate(30).expect("valid fencing token");
@@ -601,7 +626,7 @@ async fn append_session_with_mismatched_fencing_token_errors(
 
     assert_matches!(
         result,
-        Err(S2Error::AppendConditionFailed(AppendConditionFailed::FencingTokenMismatch(fencing_token))) => {
+        Err(AppendSessionError::Append(AppendError::ConditionFailed(AppendConditionFailed::FencingTokenMismatch(fencing_token)))) => {
             assert_eq!(fencing_token, fencing_token_1)
         }
     );
@@ -611,12 +636,12 @@ async fn append_session_with_mismatched_fencing_token_errors(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_empty_stream_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_empty_stream_errors(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let result = stream.read(ReadInput::new()).await;
 
     assert_matches!(
         result,
-        Err(S2Error::ReadUnwritten(StreamPosition {
+        Err(ReadError::ReadUnwritten(StreamPosition {
             seq_num: 0,
             timestamp: 0,
             ..
@@ -628,7 +653,7 @@ async fn read_empty_stream_errors(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_beyond_tail_errors(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -644,7 +669,7 @@ async fn read_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Error> {
 
     assert_matches!(
         result,
-        Err(S2Error::ReadUnwritten(StreamPosition { seq_num: 1, .. }))
+        Err(ReadError::ReadUnwritten(StreamPosition { seq_num: 1, .. }))
     );
 
     Ok(())
@@ -652,7 +677,9 @@ async fn read_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_beyond_tail_with_clamp_to_tail_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_beyond_tail_with_clamp_to_tail_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -674,7 +701,7 @@ async fn read_beyond_tail_with_clamp_to_tail_errors(stream: &S2Stream) -> Result
 
     assert_matches!(
         result,
-        Err(S2Error::ReadUnwritten(StreamPosition { seq_num: 1, .. }))
+        Err(ReadError::ReadUnwritten(StreamPosition { seq_num: 1, .. }))
     );
 
     Ok(())
@@ -684,7 +711,7 @@ async fn read_beyond_tail_with_clamp_to_tail_errors(stream: &S2Stream) -> Result
 #[tokio_shared_rt::test(shared)]
 async fn read_beyond_tail_with_clamp_to_tail_and_wait_returns_empty_batch(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -713,7 +740,9 @@ async fn read_beyond_tail_with_clamp_to_tail_and_wait_returns_empty_batch(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_session_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_session_beyond_tail_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -724,13 +753,16 @@ async fn read_session_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Erro
     assert_eq!(ack.end.seq_num, 1);
 
     let result = stream
-        .read_session(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(10))))
+        .read_session(
+            ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::SeqNum(10))),
+            ReadSessionConfig::default(),
+        )
         .await;
 
     assert!(result.is_err());
     assert_matches!(
         result.err().expect("should be err"),
-        S2Error::ReadUnwritten(StreamPosition { seq_num: 1, .. })
+        ReadSessionError::Read(ReadError::ReadUnwritten(StreamPosition { seq_num: 1, .. }))
     );
 
     Ok(())
@@ -738,7 +770,9 @@ async fn read_session_beyond_tail_errors(stream: &S2Stream) -> Result<(), S2Erro
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_session_beyond_tail_with_clamp_to_tail(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_session_beyond_tail_with_clamp_to_tail(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -748,18 +782,21 @@ async fn read_session_beyond_tail_with_clamp_to_tail(stream: &S2Stream) -> Resul
     assert_eq!(ack.start.seq_num, 0);
     assert_eq!(ack.end.seq_num, 1);
 
-    let mut batches = stream
+    let mut session = stream
         .read_session(
             ReadInput::new().with_start(
                 ReadStart::new()
                     .with_from(ReadFrom::SeqNum(10))
                     .with_clamp_to_tail(true),
             ),
+            ReadSessionConfig::default(),
         )
         .await?;
 
-    let result = tokio::time::timeout(Duration::from_secs(1), batches.next()).await;
+    assert_eq!(session.resume_seq_num(), None);
+    let result = tokio::time::timeout(Duration::from_secs(1), session.next()).await;
     assert_matches!(result, Err(tokio::time::error::Elapsed { .. }));
+    assert_eq!(session.resume_seq_num(), Some(ack.tail.seq_num));
 
     Ok(())
 }
@@ -768,7 +805,7 @@ async fn read_session_beyond_tail_with_clamp_to_tail(stream: &S2Stream) -> Resul
 #[tokio_shared_rt::test(shared)]
 async fn read_session_reports_caught_up_after_tail_delivery(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let ack = stream
         .append(AppendInput::new(AppendRecordBatch::try_from_iter([
             AppendRecord::new("first")?,
@@ -778,16 +815,18 @@ async fn read_session_reports_caught_up_after_tail_delivery(
     let mut session = stream
         .read_session(
             ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::TailOffset(2))),
+            ReadSessionConfig::default(),
         )
         .await?;
     let mut caught_up = session.caught_up();
     let mut seq_nums = Vec::new();
 
     assert!(!session.is_caught_up());
+    assert_eq!(session.resume_seq_num(), None);
     let caught_up_tail = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
-                tail = &mut caught_up => break tail.map_err(S2Error::from),
+                tail = &mut caught_up => break tail,
                 batch = session.next() => {
                     let batch = batch.expect("session should reach the tail")?;
                     seq_nums.extend(batch.records.into_iter().map(|record| record.seq_num));
@@ -801,6 +840,7 @@ async fn read_session_reports_caught_up_after_tail_delivery(
     assert!(session.is_caught_up());
     assert_eq!(seq_nums, [ack.tail.seq_num - 2, ack.tail.seq_num - 1]);
     assert_eq!(caught_up_tail, ack.tail);
+    assert_eq!(session.resume_seq_num(), Some(ack.tail.seq_num));
 
     let next_ack = stream
         .append(AppendInput::new(AppendRecordBatch::try_from_iter([
@@ -828,7 +868,9 @@ async fn read_session_reports_caught_up_after_tail_delivery(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_empty_header_value(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_empty_header_value(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?
@@ -849,7 +891,9 @@ async fn append_with_empty_header_value(stream: &S2Stream) -> Result<(), S2Error
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_mixed_records_with_and_without_headers(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_mixed_records_with_and_without_headers(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_headers([Header::new("key1", "value1")])?,
         AppendRecord::new("ipsum")?
@@ -874,7 +918,9 @@ async fn append_mixed_records_with_and_without_headers(stream: &S2Stream) -> Res
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn check_tail_after_multiple_appends(stream: &S2Stream) -> Result<(), S2Error> {
+async fn check_tail_after_multiple_appends(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input1 = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
     )?])?);
@@ -905,7 +951,7 @@ async fn check_tail_after_multiple_appends(stream: &S2Stream) -> Result<(), S2Er
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_timestamp(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_timestamp(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -941,7 +987,9 @@ async fn read_from_timestamp(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_timestamp_with_count_limit(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_timestamp_with_count_limit(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -974,7 +1022,9 @@ async fn read_from_timestamp_with_count_limit(stream: &S2Stream) -> Result<(), S
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_timestamp_with_bytes_limit(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_timestamp_with_bytes_limit(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -1008,7 +1058,9 @@ async fn read_from_timestamp_with_bytes_limit(stream: &S2Stream) -> Result<(), S
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_timestamp_in_future_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_timestamp_in_future_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -1029,7 +1081,7 @@ async fn read_from_timestamp_in_future_errors(stream: &S2Stream) -> Result<(), S
         )
         .await;
 
-    assert_matches!(result, Err(S2Error::ReadUnwritten(tail)) => {
+    assert_matches!(result, Err(ReadError::ReadUnwritten(tail)) => {
         assert_eq!(tail.seq_num, 2);
         assert_eq!(tail.timestamp, base_timestamp + 1);
     });
@@ -1075,7 +1127,7 @@ fn fencing_token_rejects_too_long() {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_max_batch_size(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_max_batch_size(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let records = (0..1000)
         .map(|_| AppendRecord::new("a"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1091,7 +1143,7 @@ async fn append_max_batch_size(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_client_timestamp(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_client_timestamp(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let timestamp = past_millis(1_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
@@ -1109,7 +1161,7 @@ async fn append_with_client_timestamp(stream: &S2Stream) -> Result<(), S2Error> 
 #[tokio_shared_rt::test(shared)]
 async fn append_without_timestamp_client_require_errors(
     basin: &SharedS2Basin,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream_name = unique_stream_name();
     let config = StreamConfig::new()
         .with_timestamping(TimestampingConfig::new().with_mode(TimestampingMode::ClientRequire));
@@ -1127,7 +1179,7 @@ async fn append_without_timestamp_client_require_errors(
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(AppendError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "invalid");
         }
     );
@@ -1143,7 +1195,7 @@ async fn append_without_timestamp_client_require_errors(
 #[tokio_shared_rt::test(shared)]
 async fn append_with_future_timestamp_uncapped_false_caps(
     basin: &SharedS2Basin,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream_name = unique_stream_name();
     let config =
         StreamConfig::new().with_timestamping(TimestampingConfig::new().with_uncapped(false));
@@ -1175,7 +1227,7 @@ async fn append_with_future_timestamp_uncapped_false_caps(
 #[tokio_shared_rt::test(shared)]
 async fn append_with_future_timestamp_uncapped_true_preserves(
     basin: &SharedS2Basin,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream_name = unique_stream_name();
     let config =
         StreamConfig::new().with_timestamping(TimestampingConfig::new().with_uncapped(true));
@@ -1205,7 +1257,9 @@ async fn append_with_future_timestamp_uncapped_true_preserves(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_with_past_timestamp_adjusts_monotonic(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_with_past_timestamp_adjusts_monotonic(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base = past_millis(10_000);
     let first_timestamp = base + 10;
     let past_timestamp = base;
@@ -1229,7 +1283,9 @@ async fn append_with_past_timestamp_adjusts_monotonic(stream: &S2Stream) -> Resu
 
 #[test_context(SharedS2Basin)]
 #[tokio_shared_rt::test(shared)]
-async fn append_to_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<(), S2Error> {
+async fn append_to_nonexistent_stream_errors(
+    basin: &SharedS2Basin,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = basin.stream(unique_stream_name());
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "lorem",
@@ -1239,7 +1295,7 @@ async fn append_to_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<()
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(AppendError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "stream_not_found");
         }
     );
@@ -1249,7 +1305,9 @@ async fn append_to_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<()
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_invalid_command_header_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_invalid_command_header_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let record = AppendRecord::new("lorem")?.with_headers([Header::new("", "not-a-command")])?;
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([record])?);
 
@@ -1257,7 +1315,7 @@ async fn append_invalid_command_header_errors(stream: &S2Stream) -> Result<(), S
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(AppendError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "invalid");
         }
     );
@@ -1269,7 +1327,7 @@ async fn append_invalid_command_header_errors(stream: &S2Stream) -> Result<(), S
 #[tokio_shared_rt::test(shared)]
 async fn append_invalid_command_header_with_extra_headers_errors(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let record = AppendRecord::new("lorem")?
         .with_headers([Header::new("", "fence"), Header::new("extra", "value")])?;
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([record])?);
@@ -1278,7 +1336,7 @@ async fn append_invalid_command_header_with_extra_headers_errors(
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(AppendError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "invalid");
         }
     );
@@ -1288,7 +1346,7 @@ async fn append_invalid_command_header_with_extra_headers_errors(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn fence_set_and_clear_token(stream: &S2Stream) -> Result<(), S2Error> {
+async fn fence_set_and_clear_token(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let token = FencingToken::generate(30).expect("valid fencing token");
     let set_input = AppendInput::new(AppendRecordBatch::try_from_iter([CommandRecord::fence(
         token.clone(),
@@ -1319,7 +1377,7 @@ async fn fence_set_and_clear_token(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn trim_command_is_accepted(stream: &S2Stream) -> Result<(), S2Error> {
+async fn trim_command_is_accepted(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("record-1")?,
         AppendRecord::new("record-2")?,
@@ -1339,7 +1397,7 @@ async fn trim_command_is_accepted(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn trim_to_future_seq_num_noop(stream: &S2Stream) -> Result<(), S2Error> {
+async fn trim_to_future_seq_num_noop(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([AppendRecord::new(
         "record-1",
     )?])?);
@@ -1358,7 +1416,9 @@ async fn trim_to_future_seq_num_noop(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_empty_stream_with_wait_returns_empty(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_empty_stream_with_wait_returns_empty(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let batch = stream
         .read(ReadInput::new().with_stop(ReadStop::new().with_wait(1)))
         .await?;
@@ -1370,7 +1430,9 @@ async fn read_empty_stream_with_wait_returns_empty(stream: &S2Stream) -> Result<
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_count_zero_returns_empty(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_count_zero_returns_empty(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -1391,7 +1453,9 @@ async fn read_with_count_zero_returns_empty(stream: &S2Stream) -> Result<(), S2E
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_with_bytes_zero_returns_empty(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_with_bytes_zero_returns_empty(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?,
         AppendRecord::new("ipsum")?,
@@ -1412,7 +1476,9 @@ async fn read_with_bytes_zero_returns_empty(stream: &S2Stream) -> Result<(), S2E
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_from_tail_offset_variants(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_from_tail_offset_variants(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("record-0")?,
         AppendRecord::new("record-1")?,
@@ -1425,7 +1491,7 @@ async fn read_from_tail_offset_variants(stream: &S2Stream) -> Result<(), S2Error
     let result = stream
         .read(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::TailOffset(0))))
         .await;
-    assert_matches!(result, Err(S2Error::ReadUnwritten(StreamPosition { .. })));
+    assert_matches!(result, Err(ReadError::ReadUnwritten(StreamPosition { .. })));
 
     let batch = stream
         .read(ReadInput::new().with_start(ReadStart::new().with_from(ReadFrom::TailOffset(3))))
@@ -1443,7 +1509,7 @@ async fn read_from_tail_offset_variants(stream: &S2Stream) -> Result<(), S2Error
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_until_timestamp(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_until_timestamp(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -1465,7 +1531,9 @@ async fn read_until_timestamp(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn read_start_timestamp_ge_until_errors(stream: &S2Stream) -> Result<(), S2Error> {
+async fn read_start_timestamp_ge_until_errors(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base_timestamp = past_millis(10_000);
     let input = AppendInput::new(AppendRecordBatch::try_from_iter([
         AppendRecord::new("lorem")?.with_timestamp(base_timestamp),
@@ -1484,7 +1552,7 @@ async fn read_start_timestamp_ge_until_errors(stream: &S2Stream) -> Result<(), S
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(ReadError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "invalid");
         }
     );
@@ -1494,13 +1562,15 @@ async fn read_start_timestamp_ge_until_errors(stream: &S2Stream) -> Result<(), S
 
 #[test_context(SharedS2Basin)]
 #[tokio_shared_rt::test(shared)]
-async fn read_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<(), S2Error> {
+async fn read_nonexistent_stream_errors(
+    basin: &SharedS2Basin,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = basin.stream(unique_stream_name());
     let result = stream.read(ReadInput::new()).await;
 
     assert_matches!(
         result,
-        Err(S2Error::Server(ErrorResponse { code, .. })) => {
+        Err(ReadError::Request(RequestError::Server(ServerError { code, .. }))) => {
             assert_eq!(code, "stream_not_found");
         }
     );
@@ -1510,7 +1580,9 @@ async fn read_nonexistent_stream_errors(basin: &SharedS2Basin) -> Result<(), S2E
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn append_session_close_delivers_all_acks(stream: &S2Stream) -> Result<(), S2Error> {
+async fn append_session_close_delivers_all_acks(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = stream.append_session(AppendSessionConfig::default());
 
     let ticket1 = session
@@ -1550,7 +1622,7 @@ async fn append_session_close_delivers_all_acks(stream: &S2Stream) -> Result<(),
 #[tokio_shared_rt::test(shared)]
 async fn batch_submit_ticket_drop_should_not_affect_others(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = stream.append_session(AppendSessionConfig::default());
 
     let _ticket1 = session
@@ -1578,7 +1650,7 @@ async fn batch_submit_ticket_drop_should_not_affect_others(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn producer_delivers_all_acks(stream: &S2Stream) -> Result<(), S2Error> {
+async fn producer_delivers_all_acks(stream: &S2Stream) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(ProducerConfig::default());
 
     let ack1 = producer.submit(AppendRecord::new("lorem")?).await?.await?;
@@ -1594,9 +1666,184 @@ async fn producer_delivers_all_acks(stream: &S2Stream) -> Result<(), S2Error> {
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
+async fn producer_flushes_partial_batch_without_waiting_for_linger(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let producer = stream.producer(
+        ProducerConfig::new()
+            .with_batching(BatchingConfig::new().with_linger(Duration::from_secs(60 * 60))),
+    );
+    let ticket = producer.submit(AppendRecord::new("lorem")?).await?;
+
+    tokio::time::timeout(Duration::from_secs(10), producer.flush())
+        .await
+        .expect("producer flush timed out")?;
+
+    let ack = ticket
+        .now_or_never()
+        .expect("covered ticket should be ready after flush")?;
+    assert_eq!(ack.seq_num, 0);
+
+    producer.close().await?;
+    Ok(())
+}
+
+#[test_context(S2Stream)]
+#[tokio_shared_rt::test(shared)]
+async fn producer_flush_delivers_all_indexed_acks(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let producer = stream.producer(
+        ProducerConfig::new()
+            .with_batching(BatchingConfig::new().with_linger(Duration::from_secs(60 * 60))),
+    );
+    let ticket1 = producer.submit(AppendRecord::new("lorem")?).await?;
+    let ticket2 = producer.submit(AppendRecord::new("ipsum")?).await?;
+    let ticket3 = producer.submit(AppendRecord::new("dolor")?).await?;
+
+    producer.flush().await?;
+
+    let ack1 = ticket1
+        .now_or_never()
+        .expect("covered ticket1 should be ready after flush")?;
+    let ack2 = ticket2
+        .now_or_never()
+        .expect("covered ticket2 should be ready after flush")?;
+    let ack3 = ticket3
+        .now_or_never()
+        .expect("covered ticket3 should be ready after flush")?;
+
+    assert_eq!(ack1.seq_num, 0);
+    assert_eq!(ack2.seq_num, 1);
+    assert_eq!(ack3.seq_num, 2);
+    assert_eq!(ack1.batch, ack2.batch);
+    assert_eq!(ack2.batch, ack3.batch);
+
+    producer.close().await?;
+    Ok(())
+}
+
+#[test_context(S2Stream)]
+#[tokio_shared_rt::test(shared)]
+async fn producer_flush_is_reusable_and_excludes_later_submission(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let producer = stream.producer(
+        ProducerConfig::new()
+            .with_match_seq_num(0)
+            .with_batching(BatchingConfig::new().with_linger(Duration::from_secs(60 * 60))),
+    );
+    let ticket1 = producer.submit(AppendRecord::new("lorem")?).await?;
+
+    let record2 = AppendRecord::new("ipsum")?;
+    let permit2 = producer.reserve(record2.metered_bytes() as u32).await?;
+    let mut flush = Box::pin(producer.flush());
+    assert!(poll!(flush.as_mut()).is_pending());
+    let mut ticket2 = Box::pin(permit2.submit(record2));
+
+    tokio::time::timeout(Duration::from_secs(10), flush)
+        .await
+        .expect("first producer flush timed out")?;
+    let ack1 = ticket1
+        .now_or_never()
+        .expect("record before the barrier should be ready")?;
+    assert_eq!(ack1.seq_num, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), ticket2.as_mut())
+            .await
+            .is_err(),
+        "record after the barrier should not be included in its durability wait"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), producer.flush())
+        .await
+        .expect("second producer flush timed out")?;
+    let ack2 = ticket2.await?;
+    assert_eq!(ack2.seq_num, 1);
+    assert_ne!(ack1.batch, ack2.batch);
+
+    producer.close().await?;
+    Ok(())
+}
+
+#[test_context(S2Stream)]
+#[tokio_shared_rt::test(shared)]
+async fn producer_empty_flush_is_immediate_and_reusable(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let producer = stream.producer(
+        ProducerConfig::new()
+            .with_batching(BatchingConfig::new().with_linger(Duration::from_secs(60 * 60))),
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), producer.flush())
+        .await
+        .expect("empty producer flush timed out")?;
+    assert_eq!(stream.check_tail().await?.seq_num, 0);
+
+    let ticket = producer.submit(AppendRecord::new("lorem")?).await?;
+    producer.flush().await?;
+    let ack = ticket
+        .now_or_never()
+        .expect("ticket should be ready after the second flush")?;
+    assert_eq!(ack.seq_num, 0);
+
+    producer.close().await?;
+    Ok(())
+}
+
+#[test_context(S2Stream)]
+#[tokio_shared_rt::test(shared)]
+async fn producer_flush_propagates_condition_failure_to_covered_ticket(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stream
+        .append(AppendInput::new(AppendRecordBatch::try_from_iter([
+            AppendRecord::new("lorem")?,
+        ])?))
+        .await?;
+
+    let producer = stream.producer(
+        ProducerConfig::new()
+            .with_match_seq_num(0)
+            .with_batching(BatchingConfig::new().with_linger(Duration::from_secs(60 * 60))),
+    );
+    let ticket = producer.submit(AppendRecord::new("ipsum")?).await?;
+
+    let flush_result = tokio::time::timeout(Duration::from_secs(10), producer.flush())
+        .await
+        .expect("failing producer flush timed out");
+    assert_matches!(
+        flush_result,
+        Err(ProducerError::Append(AppendSessionError::Append(
+            AppendError::ConditionFailed(AppendConditionFailed::SeqNumMismatch(1))
+        )))
+    );
+
+    let ticket_result = ticket
+        .now_or_never()
+        .expect("covered ticket should be ready when flush fails");
+    assert_matches!(
+        ticket_result,
+        Err(ProducerError::Append(AppendSessionError::Append(
+            AppendError::ConditionFailed(AppendConditionFailed::SeqNumMismatch(1))
+        )))
+    );
+    assert_matches!(
+        producer.flush().await,
+        Err(ProducerError::Append(AppendSessionError::Append(
+            AppendError::ConditionFailed(AppendConditionFailed::SeqNumMismatch(1))
+        )))
+    );
+
+    Ok(())
+}
+
+#[test_context(S2Stream)]
+#[tokio_shared_rt::test(shared)]
 async fn producer_close_delivers_all_indexed_acks_from_same_ack(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(ProducerConfig::default());
 
     let ticket1 = producer.submit(AppendRecord::new("lorem")?).await?;
@@ -1623,7 +1870,7 @@ async fn producer_close_delivers_all_indexed_acks_from_same_ack(
 #[tokio_shared_rt::test(shared)]
 async fn producer_close_delivers_all_indexed_acks_from_different_acks(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(ProducerConfig::default().with_batching(
         BatchingConfig::default().with_limits(BatchLimits::default().with_max_batch_records(1)?),
     ));
@@ -1650,7 +1897,9 @@ async fn producer_close_delivers_all_indexed_acks_from_different_acks(
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn producer_drop_errors_all_claimable_tickets(stream: &S2Stream) -> Result<(), S2Error> {
+async fn producer_drop_errors_all_claimable_tickets(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(
         ProducerConfig::default()
             .with_batching(BatchingConfig::default().with_linger(Duration::from_secs(1))),
@@ -1664,19 +1913,17 @@ async fn producer_drop_errors_all_claimable_tickets(stream: &S2Stream) -> Result
     let result1 = ticket1.await;
     let result2 = ticket2.await;
 
-    assert_matches!(result1, Err(S2Error::Client(msg)) => {
-        assert_eq!(msg, "producer dropped without calling close");
-    });
-    assert_matches!(result2, Err(S2Error::Client(msg)) => {
-        assert_eq!(msg, "producer dropped without calling close");
-    });
+    assert_matches!(result1, Err(ProducerError::ProducerDropped) => {});
+    assert_matches!(result2, Err(ProducerError::ProducerDropped) => {});
 
     Ok(())
 }
 
 #[test_context(S2Stream)]
 #[tokio_shared_rt::test(shared)]
-async fn producer_drop_errors_no_claimable_tickets(stream: &S2Stream) -> Result<(), S2Error> {
+async fn producer_drop_errors_no_claimable_tickets(
+    stream: &S2Stream,
+) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(ProducerConfig::default());
 
     let ticket1 = producer.submit(AppendRecord::new("lorem")?).await?;
@@ -1701,7 +1948,7 @@ async fn producer_drop_errors_no_claimable_tickets(stream: &S2Stream) -> Result<
 #[tokio_shared_rt::test(shared)]
 async fn record_submit_ticket_drop_should_not_affect_others(
     stream: &S2Stream,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let producer = stream.producer(ProducerConfig::default());
 
     let _ticket1 = producer.submit(AppendRecord::new("lorem")?).await?;
@@ -1718,7 +1965,7 @@ async fn record_submit_ticket_drop_should_not_affect_others(
 }
 
 #[tokio::test]
-async fn create_stream_inherits_basin_default_config() -> Result<(), S2Error> {
+async fn create_stream_inherits_basin_default_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = s2_config(Compression::None).expect("valid S2 config");
     let s2 = s2_sdk::S2::new(config).expect("valid S2");
 
@@ -1764,7 +2011,9 @@ async fn create_stream_inherits_basin_default_config() -> Result<(), S2Error> {
 #[case::gzip(Compression::Gzip)]
 #[case::zstd(Compression::Zstd)]
 #[tokio::test]
-async fn compression_roundtrip_unary(#[case] compression: Compression) -> Result<(), S2Error> {
+async fn compression_roundtrip_unary(
+    #[case] compression: Compression,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = s2_config(compression).expect("valid S2 config");
     let s2 = s2_sdk::S2::new(config).expect("valid S2");
 
@@ -1809,7 +2058,7 @@ async fn compression_roundtrip_unary(#[case] compression: Compression) -> Result
 #[tokio::test]
 async fn compression_with_no_side_effects_unary(
     #[case] compression: Compression,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = s2_config(compression)
         .expect("valid S2 config")
         .with_retry(RetryConfig::new().with_append_retry_policy(AppendRetryPolicy::NoSideEffects));
@@ -1852,7 +2101,9 @@ async fn compression_with_no_side_effects_unary(
 #[case::gzip(Compression::Gzip)]
 #[case::zstd(Compression::Zstd)]
 #[tokio::test]
-async fn compression_roundtrip_session(#[case] compression: Compression) -> Result<(), S2Error> {
+async fn compression_roundtrip_session(
+    #[case] compression: Compression,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = s2_config(compression).expect("valid S2 config");
     let s2 = s2_sdk::S2::new(config).expect("valid S2");
 
@@ -1886,7 +2137,9 @@ async fn compression_roundtrip_session(#[case] compression: Compression) -> Resu
     assert_eq!(ack.start.seq_num, 0);
     assert_eq!(ack.end.seq_num, 1);
 
-    let mut batches = stream.read_session(ReadInput::new()).await?;
+    let mut batches = stream
+        .read_session(ReadInput::new(), ReadSessionConfig::default())
+        .await?;
     let batch = batches.next().await.expect("should have batch")?;
     assert_eq!(batch.records.len(), 1);
     assert_eq!(batch.records[0].body.len(), 20480);
@@ -1903,7 +2156,7 @@ async fn compression_roundtrip_session(#[case] compression: Compression) -> Resu
 #[tokio_shared_rt::test(shared)]
 async fn append_session_for_non_existent_stream_errors(
     basin: &SharedS2Basin,
-) -> Result<(), S2Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = basin.stream(unique_stream_name());
 
     let session = stream.append_session(AppendSessionConfig::new());
@@ -1914,7 +2167,7 @@ async fn append_session_for_non_existent_stream_errors(
 
     let result = session.submit(input).await?.await;
 
-    assert_matches!(result, Err(S2Error::Server(err)) => {
+    assert_matches!(result, Err(AppendSessionError::Append(AppendError::Request(RequestError::Server(err)))) => {
         assert_eq!(err.code, "stream_not_found");
     });
 
@@ -1923,7 +2176,9 @@ async fn append_session_for_non_existent_stream_errors(
 
 #[test_context(SharedS2Basin)]
 #[tokio_shared_rt::test(shared)]
-async fn producer_for_non_existent_stream_errors(basin: &SharedS2Basin) -> Result<(), S2Error> {
+async fn producer_for_non_existent_stream_errors(
+    basin: &SharedS2Basin,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stream = basin.stream(unique_stream_name());
 
     let producer = stream.producer(ProducerConfig::new().with_batching(
@@ -1938,16 +2193,18 @@ async fn producer_for_non_existent_stream_errors(basin: &SharedS2Basin) -> Resul
             .await
         {
             Ok(ticket) => tickets.push(ticket),
-            Err(S2Error::Server(err)) => {
+            Err(ProducerError::Append(AppendSessionError::Append(AppendError::Request(
+                RequestError::Server(err),
+            )))) => {
                 assert_eq!(err.code, "stream_not_found");
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
     for ticket in tickets {
         let result = ticket.await;
-        assert_matches!(result, Err(S2Error::Server(err)) => {
+        assert_matches!(result, Err(ProducerError::Append(AppendSessionError::Append(AppendError::Request(RequestError::Server(err))))) => {
             assert_eq!(err.code, "stream_not_found");
         });
     }
@@ -1956,7 +2213,8 @@ async fn producer_for_non_existent_stream_errors(basin: &SharedS2Basin) -> Resul
 }
 
 #[tokio::test]
-async fn stream_config_applies_only_when_append_creates_stream() -> Result<(), S2Error> {
+async fn stream_config_applies_only_when_append_creates_stream()
+-> Result<(), Box<dyn std::error::Error>> {
     let s2 = s2();
     let basin_name = unique_basin_name();
     s2.create_basin(

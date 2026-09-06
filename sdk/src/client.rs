@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, RwLock as StdRwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -29,7 +29,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 pub use hyper_util::client::legacy::connect::Connect;
 use hyper_util::{
     client::legacy::{Client as HyperClient, connect::HttpConnector},
-    rt::TokioExecutor,
+    rt::{TokioExecutor, TokioTimer},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
@@ -68,21 +68,21 @@ impl From<crate::types::Compression> for Compression {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub(crate) enum HttpError {
     #[error("send error: {0}")]
     Send(#[from] hyper_util::client::legacy::Error),
     #[error("receive error: {0}")]
     Receive(#[from] hyper::Error),
-    #[error("http error: {0}")]
-    Http(#[from] http::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("url encoding error: {0}")]
-    UrlEncoded(#[from] serde_urlencoded::ser::Error),
+    #[error("request build error: {0}")]
+    RequestBuild(String),
+    #[error("response decode error: {0}")]
+    ResponseDecode(#[source] serde_json::Error),
     #[error("timeout")]
     Timeout,
-    #[error("compression error: {0}")]
-    Compression(String),
+    #[error("request compression error: {0}")]
+    RequestCompression(String),
+    #[error("response compression error: {0}")]
+    ResponseCompression(String),
 }
 
 enum BodyInner {
@@ -165,7 +165,7 @@ impl Request {
         }
     }
 
-    pub async fn compress(self) -> Result<Self, Error> {
+    pub async fn compress(self) -> Result<Self, HttpError> {
         let (body, content_encoding) = compress_body(self.body, self.compression).await?;
         let mut headers = self.headers;
         if let Some(encoding) = content_encoding {
@@ -208,7 +208,7 @@ pub struct RequestBuilder {
     body: Option<Body>,
     timeout: Option<Duration>,
     compression: Compression,
-    error: Option<Error>,
+    error: Option<HttpError>,
 }
 
 impl RequestBuilder {
@@ -255,13 +255,13 @@ impl RequestBuilder {
                     self.uri = match uri_with_query(&self.uri, &query_string) {
                         Ok(uri) => uri,
                         Err(e) => {
-                            self.error = Some(Error::Http(e.into()));
+                            self.error = Some(HttpError::RequestBuild(e.to_string()));
                             return self;
                         }
                     };
                 }
             }
-            Err(e) => self.error = Some(Error::UrlEncoded(e)),
+            Err(e) => self.error = Some(HttpError::RequestBuild(e.to_string())),
         }
         self
     }
@@ -276,7 +276,7 @@ impl RequestBuilder {
                 self.headers.insert(CONTENT_TYPE, APPLICATION_JSON);
                 self.body = Some(Body::from(data));
             }
-            Err(e) => self.error = Some(Error::Json(e)),
+            Err(e) => self.error = Some(HttpError::RequestBuild(e.to_string())),
         }
         self
     }
@@ -297,8 +297,8 @@ impl RequestBuilder {
             (Ok(name), Ok(value)) => {
                 self.headers.insert(name, value);
             }
-            (Err(e), _) => self.error = Some(Error::Http(e.into())),
-            (_, Err(e)) => self.error = Some(Error::Http(e.into())),
+            (Err(e), _) => self.error = Some(HttpError::RequestBuild(e.into().to_string())),
+            (_, Err(e)) => self.error = Some(HttpError::RequestBuild(e.into().to_string())),
         }
         self
     }
@@ -320,7 +320,7 @@ impl RequestBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Request, Error> {
+    pub fn build(self) -> Result<Request, HttpError> {
         if let Some(e) = self.error {
             return Err(e);
         }
@@ -343,6 +343,15 @@ pub struct UnaryResponse {
 }
 
 impl UnaryResponse {
+    #[cfg(all(test, feature = "_hidden"))]
+    pub(crate) fn new_for_test(status: StatusCode, bytes: impl Into<Bytes>) -> Self {
+        Self {
+            status,
+            headers: HeaderMap::new(),
+            bytes: bytes.into(),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -355,8 +364,43 @@ impl UnaryResponse {
         self.bytes
     }
 
-    pub fn json<T: DeserializeOwned>(self) -> Result<T, Error> {
-        Ok(serde_json::from_slice(&self.bytes)?)
+    pub fn json<T: DeserializeOwned>(self) -> Result<T, HttpError> {
+        serde_json::from_slice(&self.bytes).map_err(HttpError::ResponseDecode)
+    }
+}
+
+/// Identifies a pooled connection within its host pool, so poisoning drops
+/// just the connection reconnect advice arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionId(u64);
+
+impl ConnectionId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Grants its holder the ability to poison the pooled connection a streaming
+/// response was served on, dropping it from the pool so no new request reuses
+/// it. Requests already in flight keep the connection.
+///
+/// Poisoning is idempotent: the connection is identified by its
+/// [`ConnectionId`], so poisoning it again — including from another session
+/// sharing the connection — is a no-op.
+pub struct PoisonHandle {
+    poison: Box<dyn Fn() + Send + Sync>,
+}
+
+impl PoisonHandle {
+    fn new(poison: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            poison: Box::new(poison),
+        }
+    }
+
+    pub(crate) fn poison(&self) {
+        (self.poison)();
     }
 }
 
@@ -365,15 +409,23 @@ pub struct StreamingResponse {
     headers: HeaderMap,
     body: Incoming,
     permit: RequestPermit,
+    poison_handle: PoisonHandle,
 }
 
 impl StreamingResponse {
-    fn new(status: StatusCode, headers: HeaderMap, body: Incoming, permit: RequestPermit) -> Self {
+    fn new(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Incoming,
+        permit: RequestPermit,
+        poison_handle: PoisonHandle,
+    ) -> Self {
         Self {
             status,
             headers,
             body,
             permit,
+            poison_handle,
         }
     }
 
@@ -381,27 +433,44 @@ impl StreamingResponse {
         self.status
     }
 
-    pub async fn into_bytes(self) -> Result<Bytes, Error> {
-        let bytes = self.body.collect().await?.to_bytes();
-        decompress_body(&self.headers, bytes).await
+    pub(crate) async fn into_bytes_with_poison_handle(
+        self,
+    ) -> Result<(Bytes, PoisonHandle), HttpError> {
+        let Self {
+            headers,
+            body,
+            permit,
+            poison_handle,
+            ..
+        } = self;
+        let bytes = body.collect().await?.to_bytes();
+        let bytes = decompress_body(&headers, bytes).await?;
+        drop(permit);
+        Ok((bytes, poison_handle))
     }
 
-    pub fn stream(self) -> impl Stream<Item = Result<Bytes, Error>> {
-        let permit = self.permit;
-        http_body_util::BodyStream::new(self.body).filter_map(move |result| {
+    pub fn into_stream(self) -> (impl Stream<Item = Result<Bytes, HttpError>>, PoisonHandle) {
+        let Self {
+            body,
+            permit,
+            poison_handle,
+            ..
+        } = self;
+        let stream = http_body_util::BodyStream::new(body).filter_map(move |result| {
             let _ = &permit;
             std::future::ready(match result {
                 Ok(frame) => frame.into_data().ok().map(Ok),
-                Err(e) => Some(Err(Error::Receive(e))),
+                Err(e) => Some(Err(HttpError::Receive(e))),
             })
-        })
+        });
+        (stream, poison_handle)
     }
 }
 
 #[async_trait]
 pub trait RequestExecutor: Send + Sync {
-    async fn execute_unary(&self, request: Request) -> Result<UnaryResponse, Error>;
-    async fn init_streaming(&self, request: Request) -> Result<StreamingResponse, Error>;
+    async fn execute_unary(&self, request: Request) -> Result<UnaryResponse, HttpError>;
+    async fn init_streaming(&self, request: Request) -> Result<StreamingResponse, HttpError>;
 }
 
 pub fn default_connector(
@@ -501,7 +570,7 @@ fn build_http_request(
     headers: HeaderMap,
     body: BoxBody,
     content_encoding: Option<HeaderValue>,
-) -> Result<http::Request<BoxBody>, Error> {
+) -> Result<http::Request<BoxBody>, HttpError> {
     let mut builder = http::Request::builder().method(method).uri(uri.clone());
 
     if let Some(req_headers) = builder.headers_mut() {
@@ -515,13 +584,15 @@ fn build_http_request(
         }
     }
 
-    Ok(builder.body(body)?)
+    builder
+        .body(body)
+        .map_err(|error| HttpError::RequestBuild(error.to_string()))
 }
 
 async fn execute_unary_with<C>(
     client: &HyperClient<C, BoxBody>,
     request: Request,
-) -> Result<UnaryResponse, Error>
+) -> Result<UnaryResponse, HttpError>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
@@ -542,13 +613,13 @@ where
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await?.to_bytes();
 
-        Ok::<_, Error>((parts.status, parts.headers, bytes))
+        Ok::<_, HttpError>((parts.status, parts.headers, bytes))
     };
 
     let (status, headers, bytes) = if let Some(timeout_duration) = request_timeout {
         timeout(timeout_duration, operation)
             .await
-            .map_err(|_| Error::Timeout)??
+            .map_err(|_| HttpError::Timeout)??
     } else {
         operation.await?
     };
@@ -566,7 +637,8 @@ async fn init_streaming_with<C>(
     client: &HyperClient<C, BoxBody>,
     request: Request,
     permit: RequestPermit,
-) -> Result<StreamingResponse, Error>
+    poison_handle: PoisonHandle,
+) -> Result<StreamingResponse, HttpError>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
@@ -584,18 +656,19 @@ where
         let response = client.request(http_request).await?;
         let (parts, body) = response.into_parts();
 
-        Ok::<_, Error>(StreamingResponse::new(
+        Ok::<_, HttpError>(StreamingResponse::new(
             parts.status,
             parts.headers,
             body,
             permit,
+            poison_handle,
         ))
     };
 
     if let Some(duration) = request_timeout {
         timeout(duration, operation)
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| HttpError::Timeout)?
     } else {
         operation.await
     }
@@ -629,12 +702,12 @@ fn uri_with_path_and_query(uri: &Uri, path_and_query: &str) -> Result<Uri, http:
 async fn compress_body(
     body: Body,
     compression: Compression,
-) -> Result<(Body, Option<HeaderValue>), Error> {
+) -> Result<(Body, Option<HeaderValue>), HttpError> {
     match compression {
         Compression::None => Ok((body, None)),
         Compression::Gzip => {
             let Some(data) = body.as_bytes() else {
-                return Err(Error::Compression(
+                return Err(HttpError::RequestCompression(
                     "streaming request bodies cannot be compressed".into(),
                 ));
             };
@@ -642,11 +715,11 @@ async fn compress_body(
             encoder
                 .write_all(data)
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::RequestCompression(e.to_string()))?;
             encoder
                 .shutdown()
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::RequestCompression(e.to_string()))?;
             let compressed = encoder.into_inner();
             Ok((
                 Body::from(compressed),
@@ -655,7 +728,7 @@ async fn compress_body(
         }
         Compression::Zstd => {
             let Some(data) = body.as_bytes() else {
-                return Err(Error::Compression(
+                return Err(HttpError::RequestCompression(
                     "streaming request bodies cannot be compressed".into(),
                 ));
             };
@@ -663,11 +736,11 @@ async fn compress_body(
             encoder
                 .write_all(data)
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::RequestCompression(e.to_string()))?;
             encoder
                 .shutdown()
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::RequestCompression(e.to_string()))?;
             let compressed = encoder.into_inner();
             Ok((
                 Body::from(compressed),
@@ -677,7 +750,7 @@ async fn compress_body(
     }
 }
 
-async fn decompress_body(headers: &HeaderMap, bytes: Bytes) -> Result<Bytes, Error> {
+async fn decompress_body(headers: &HeaderMap, bytes: Bytes) -> Result<Bytes, HttpError> {
     let content_encoding = headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok());
 
     match content_encoding {
@@ -687,7 +760,7 @@ async fn decompress_body(headers: &HeaderMap, bytes: Bytes) -> Result<Bytes, Err
             decoder
                 .read_to_end(&mut decompressed)
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::ResponseCompression(e.to_string()))?;
             Ok(Bytes::from(decompressed))
         }
         Some("zstd") => {
@@ -696,7 +769,7 @@ async fn decompress_body(headers: &HeaderMap, bytes: Bytes) -> Result<Bytes, Err
             decoder
                 .read_to_end(&mut decompressed)
                 .await
-                .map_err(|e| Error::Compression(e.to_string()))?;
+                .map_err(|e| HttpError::ResponseCompression(e.to_string()))?;
             Ok(Bytes::from(decompressed))
         }
         _ => Ok(bytes),
@@ -718,6 +791,7 @@ impl Drop for RequestPermit {
 }
 
 struct PooledClient<C> {
+    id: ConnectionId,
     client: Arc<HyperClient<C, BoxBody>>,
     active_requests: Arc<AtomicUsize>,
     idle_since: Arc<Mutex<Option<Instant>>>,
@@ -726,6 +800,7 @@ struct PooledClient<C> {
 impl<C> PooledClient<C> {
     fn new(client: HyperClient<C, BoxBody>) -> Self {
         Self {
+            id: ConnectionId::next(),
             client: Arc::new(client),
             active_requests: Arc::new(AtomicUsize::new(0)),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
@@ -757,7 +832,7 @@ impl<C> PooledClient<C> {
 }
 
 struct HostPool<C> {
-    clients: RwLock<Vec<PooledClient<C>>>,
+    clients: StdRwLock<Vec<PooledClient<C>>>,
     connector: C,
 }
 
@@ -767,29 +842,34 @@ where
 {
     fn new(connector: C) -> Self {
         Self {
-            clients: RwLock::new(Vec::new()),
+            clients: StdRwLock::new(Vec::new()),
             connector,
         }
     }
 
     fn create_client(&self) -> PooledClient<C> {
-        let client = HyperClient::builder(TokioExecutor::new()).build(self.connector.clone());
+        let client = HyperClient::builder(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .http2_only(true)
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .build(self.connector.clone());
         PooledClient::new(client)
     }
 
-    async fn checkout(&self) -> (Arc<HyperClient<C, BoxBody>>, RequestPermit) {
+    fn checkout(&self) -> (Arc<HyperClient<C, BoxBody>>, RequestPermit, ConnectionId) {
         {
-            let clients = self.clients.read().await;
+            let clients = self.clients.read().unwrap();
             for pooled in clients.iter() {
                 if let Some(permit) = pooled.request_permit() {
-                    return (pooled.client.clone(), permit);
+                    return (pooled.client.clone(), permit, pooled.id);
                 }
             }
         }
-        let mut clients = self.clients.write().await;
+        let mut clients = self.clients.write().unwrap();
         for pooled in clients.iter() {
             if let Some(permit) = pooled.request_permit() {
-                return (pooled.client.clone(), permit);
+                return (pooled.client.clone(), permit, pooled.id);
             }
         }
         let new_client = self.create_client();
@@ -797,14 +877,27 @@ where
             .request_permit()
             .expect("new client must have a permit");
         let client = new_client.client.clone();
+        let id = new_client.id;
         clients.push(new_client);
-        (client, permit)
+        (client, permit, id)
     }
 
-    async fn reap_idle_clients(&self) {
+    /// Drop the pooled client identified by `id` so no new request reuses it.
+    /// Clients pinned to servers that are not going away stay pooled, requests
+    /// already in flight keep their connection, and poisoning the same
+    /// connection again is a no-op.
+    fn poison(&self, host: &str, id: ConnectionId) {
+        let mut clients = self.clients.write().unwrap();
+        let pooled = clients.len();
+        clients.retain(|pooled| pooled.id != id);
+        let removed = pooled - clients.len();
+        tracing::debug!(host, connection = ?id, removed, "poisoned pooled connections");
+    }
+
+    fn reap_idle_clients(&self) {
         self.clients
             .write()
-            .await
+            .unwrap()
             .retain(|pooled| !pooled.should_reap(IDLE_TIMEOUT));
     }
 
@@ -861,8 +954,11 @@ where
             .clone()
     }
 
-    async fn checkout(&self, host: &str) -> (Arc<HyperClient<C, BoxBody>>, RequestPermit) {
-        self.get_or_create_host_pool(host).await.checkout().await
+    async fn checkout(
+        &self,
+        host: &str,
+    ) -> (Arc<HyperClient<C, BoxBody>>, RequestPermit, ConnectionId) {
+        self.get_or_create_host_pool(host).await.checkout()
     }
 }
 
@@ -875,7 +971,7 @@ async fn reap_idle_clients<C: Connect + Clone + Send + Sync + 'static>(
     };
 
     for pool in &pools {
-        pool.reap_idle_clients().await;
+        pool.reap_idle_clients();
     }
 
     hosts.write().await.retain(|_, pool| !pool.is_empty());
@@ -886,14 +982,24 @@ impl<C> RequestExecutor for Pool<C>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
-    async fn execute_unary(&self, request: Request) -> Result<UnaryResponse, Error> {
-        let (client, _permit) = self.checkout(request.authority()).await;
+    async fn execute_unary(&self, request: Request) -> Result<UnaryResponse, HttpError> {
+        let (client, _permit, _) = self.checkout(request.authority()).await;
         execute_unary_with(&client, request).await
     }
 
-    async fn init_streaming(&self, request: Request) -> Result<StreamingResponse, Error> {
-        let (client, permit) = self.checkout(request.authority()).await;
-        init_streaming_with(&client, request, permit).await
+    async fn init_streaming(&self, request: Request) -> Result<StreamingResponse, HttpError> {
+        let host = request.authority().to_owned();
+        let pool = self.get_or_create_host_pool(&host).await;
+        let (client, permit, id) = pool.checkout();
+        // Weak: the handle can outlive the pool (a session holds it for the
+        // connection's lifetime) and must not keep a reaped pool alive.
+        let weak = Arc::downgrade(&pool);
+        let poison_handle = PoisonHandle::new(move || {
+            if let Some(pool) = weak.upgrade() {
+                pool.poison(&host, id);
+            }
+        });
+        init_streaming_with(&client, request, permit, poison_handle).await
     }
 }
 
@@ -944,7 +1050,7 @@ mod tests {
     async fn host_client_count(pool: &Pool<HttpConnector>, host: &str) -> usize {
         let hosts = pool.hosts.read().await;
         match hosts.get(host) {
-            Some(pool) => pool.clients.read().await.len(),
+            Some(pool) => pool.clients.read().unwrap().len(),
             None => 0,
         }
     }
@@ -987,7 +1093,7 @@ mod tests {
         let pool = test_pool();
         let mut permits = Vec::new();
         for _ in 0..MAX_CONCURRENT_REQUESTS_PER_CLIENT {
-            let (_client, permit) = pool.checkout(TEST_HOST).await;
+            let (_client, permit, _) = pool.checkout(TEST_HOST).await;
             permits.push(permit);
         }
         assert_eq!(host_client_count(&pool, TEST_HOST).await, 1);
@@ -998,12 +1104,12 @@ mod tests {
         let pool = test_pool();
         let mut permits = Vec::new();
         for _ in 0..MAX_CONCURRENT_REQUESTS_PER_CLIENT {
-            let (_client, permit) = pool.checkout(TEST_HOST).await;
+            let (_client, permit, _) = pool.checkout(TEST_HOST).await;
             permits.push(permit);
         }
         assert_eq!(host_client_count(&pool, TEST_HOST).await, 1);
 
-        let (_client, permit) = pool.checkout(TEST_HOST).await;
+        let (_client, permit, _) = pool.checkout(TEST_HOST).await;
         permits.push(permit);
         assert_eq!(host_client_count(&pool, TEST_HOST).await, 2);
     }
@@ -1013,12 +1119,12 @@ mod tests {
         let pool = test_pool();
         let mut permits = Vec::new();
         for _ in 0..MAX_CONCURRENT_REQUESTS_PER_CLIENT {
-            let (_client, permit) = pool.checkout(TEST_HOST).await;
+            let (_client, permit, _) = pool.checkout(TEST_HOST).await;
             permits.push(permit);
         }
         permits.pop();
 
-        let (_client, permit) = pool.checkout(TEST_HOST).await;
+        let (_client, permit, _) = pool.checkout(TEST_HOST).await;
         permits.push(permit);
         assert_eq!(host_client_count(&pool, TEST_HOST).await, 1);
     }
@@ -1028,10 +1134,10 @@ mod tests {
         let pool = test_pool();
         let mut permits = Vec::new();
         for _ in 0..MAX_CONCURRENT_REQUESTS_PER_CLIENT {
-            let (_client, permit) = pool.checkout(TEST_HOST).await;
+            let (_client, permit, _) = pool.checkout(TEST_HOST).await;
             permits.push(permit);
         }
-        let (_client, permit) = pool.checkout(TEST_HOST).await;
+        let (_client, permit, _) = pool.checkout(TEST_HOST).await;
         permits.push(permit);
         assert_eq!(host_client_count(&pool, TEST_HOST).await, 2);
 
@@ -1039,7 +1145,7 @@ mod tests {
         {
             let hosts = pool.hosts.read().await;
             let pool = hosts.get(TEST_HOST).unwrap();
-            let clients = pool.clients.read().await;
+            let clients = pool.clients.read().unwrap();
             for pooled in clients.iter() {
                 *pooled.idle_since.lock().unwrap() =
                     Some(Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1));
@@ -1059,12 +1165,12 @@ mod tests {
 
         let mut permits_a = Vec::new();
         for _ in 0..MAX_CONCURRENT_REQUESTS_PER_CLIENT {
-            let (_client, permit) = pool.checkout(host_a).await;
+            let (_client, permit, _) = pool.checkout(host_a).await;
             permits_a.push(permit);
         }
         assert_eq!(host_client_count(&pool, host_a).await, 1);
 
-        let (_client, permit_b) = pool.checkout(host_b).await;
+        let (_client, permit_b, _) = pool.checkout(host_b).await;
         assert_eq!(host_client_count(&pool, host_b).await, 1);
         assert_eq!(host_client_count(&pool, host_a).await, 1);
 
@@ -1076,15 +1182,15 @@ mod tests {
     async fn reaper_removes_empty_host_entries() {
         let pool = test_pool();
 
-        let (_client, permit_a) = pool.checkout("host-a:443").await;
-        let (_client, permit_b) = pool.checkout("host-b:443").await;
+        let (_client, permit_a, _) = pool.checkout("host-a:443").await;
+        let (_client, permit_b, _) = pool.checkout("host-b:443").await;
         assert_eq!(pool.hosts.read().await.len(), 2);
 
         drop(permit_a);
         {
             let hosts = pool.hosts.read().await;
             let pool_a = hosts.get("host-a:443").unwrap();
-            let clients = pool_a.clients.read().await;
+            let clients = pool_a.clients.read().unwrap();
             for pooled in clients.iter() {
                 *pooled.idle_since.lock().unwrap() =
                     Some(Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1));

@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, path::PathBuf};
+use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand, ValueEnum, builder::styling};
 use s2_sdk::types::{
@@ -26,7 +26,7 @@ const STYLES: styling::Styles = styling::Styles::styled()
 
 const GENERAL_USAGE: &str = color_print::cstr!(
     r#"
-    <dim>$</dim> <bold>s2 config set access_token YOUR_ACCESS_TOKEN</bold>
+    <dim>$</dim> <bold>s2 login</bold>
     <dim>$</dim> <bold>s2 list-basins --prefix "foo" --limit 100</bold>
     "#
 );
@@ -40,6 +40,16 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Log in to S2 through your browser.
+    Login(LoginArgs),
+
+    /// Log out of the browser-authenticated S2 session.
+    Logout(LogoutArgs),
+
+    /// Manage CLI authentication.
+    #[command(subcommand)]
+    Auth(AuthCommand),
+
     /// Manage CLI configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -227,6 +237,99 @@ pub struct UpdateArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Log in to S2 through your browser.
+    Login(LoginArgs),
+
+    /// Log out of the browser-authenticated S2 session.
+    Logout(LogoutArgs),
+
+    /// Show the active authentication method and verify it with S2.
+    Status,
+
+    /// Switch authentication methods without deleting either credential.
+    Use {
+        /// Authentication method to select.
+        method: crate::config::AuthMethod,
+    },
+
+    /// Manage a stored access token.
+    AccessToken {
+        #[command(subcommand)]
+        command: AuthAccessTokenCommand,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct LoginArgs {
+    /// Print the login URL instead of opening a browser.
+    ///
+    /// The browser must still be able to reach this machine's loopback callback.
+    #[arg(long)]
+    pub no_open: bool,
+
+    /// Maximum time to wait for browser authorization.
+    #[arg(
+        long,
+        default_value = "20m",
+        value_parser = humantime::parse_duration,
+        hide = true
+    )]
+    pub timeout: Duration,
+
+    /// Override the OAuth issuer.
+    #[arg(long, value_name = "URL", hide = true)]
+    pub issuer: Option<String>,
+
+    /// Override the OAuth client ID.
+    #[arg(long, value_name = "CLIENT_ID", hide = true)]
+    pub client_id: Option<String>,
+
+    /// Store credentials in a private file instead of the OS credential store.
+    #[arg(long)]
+    pub insecure_storage: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LogoutArgs {
+    /// Remove local credentials without attempting server-side revocation.
+    #[arg(long)]
+    pub local_only: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthAccessTokenCommand {
+    /// Store an access token.
+    Set(AuthAccessTokenSetArgs),
+
+    /// Move a legacy plaintext access token out of the config file.
+    Migrate(AuthAccessTokenMigrateArgs),
+
+    /// Remove the locally stored access token.
+    ///
+    /// This does not revoke the access token.
+    Remove,
+}
+
+#[derive(Args, Debug)]
+pub struct AuthAccessTokenSetArgs {
+    /// Read the access token from standard input instead of prompting.
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Store the token in a private file instead of the OS credential store.
+    #[arg(long)]
+    pub insecure_storage: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AuthAccessTokenMigrateArgs {
+    /// Store the token in a private file instead of the OS credential store.
+    #[arg(long)]
+    pub insecure_storage: bool,
+}
+
+#[derive(Subcommand)]
 pub enum ConfigCommand {
     /// List all configuration values.
     List,
@@ -247,6 +350,28 @@ pub enum ConfigCommand {
         /// Config key
         key: crate::config::ConfigKey,
     },
+}
+
+impl std::fmt::Debug for ConfigCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::List => formatter.write_str("List"),
+            Self::Get { key } => formatter.debug_struct("Get").field("key", key).finish(),
+            Self::Set { key, value } => formatter
+                .debug_struct("Set")
+                .field("key", key)
+                .field(
+                    "value",
+                    if matches!(key, crate::config::ConfigKey::AccessToken) {
+                        &"<redacted>" as &dyn std::fmt::Debug
+                    } else {
+                        value as &dyn std::fmt::Debug
+                    },
+                )
+                .finish(),
+            Self::Unset { key } => formatter.debug_struct("Unset").field("key", key).finish(),
+        }
+    }
 }
 
 #[derive(Args, Debug)]

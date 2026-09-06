@@ -43,11 +43,13 @@ use tracing::{debug, warn};
 
 use crate::{
     client::{self, StreamingResponse, UnaryResponse},
+    error::{ClientError, server_error_has_no_side_effects, server_error_is_retryable},
     frame_signal::FrameSignal,
+    reconnect::ReconnectAdvice,
     retry::{RetryBackoff, RetryBackoffBuilder},
     types::{
-        AccessTokenId, AppendRetryPolicy, BasinAuthority, BasinName, Compression, EncryptionKey,
-        LocationName, RetryConfig, S2Config, S2Endpoints, StreamName,
+        AccessToken, AccessTokenId, AccessTokenMode, AppendRetryPolicy, BasinAuthority, BasinName,
+        Compression, EncryptionKey, LocationName, RetryConfig, S2Config, S2Endpoints, StreamName,
     },
 };
 const CONTENT_TYPE_S2S: &str = "s2s/proto";
@@ -408,7 +410,7 @@ impl BasinClient {
                 } else {
                     Err(ApiError::Server(
                         status,
-                        response.json::<ApiErrorResponse>()?,
+                        response.json::<ServerErrorBody>()?,
                     ))
                 }
             })
@@ -451,6 +453,7 @@ impl BasinClient {
         encryption: Option<&EncryptionKey>,
         stream_config: Option<&StreamConfig>,
         frame_signal: Option<FrameSignal>,
+        reconnect: ReconnectAdvice,
     ) -> Result<Streaming<AppendAck>, ApiError>
     where
         I: Stream<Item = AppendInput> + Send + 'static,
@@ -480,18 +483,24 @@ impl BasinClient {
         let mut request = request_builder.build()?;
         set_encryption_header(&mut request, encryption);
         set_stream_config_header(&mut request, stream_config);
-        let response = self
-            .client
-            .init_streaming(request)
-            .await?
-            .into_result()
-            .await?;
-        let mut bytes_stream = response.stream();
+        let (response, access_token) = self.client.init_streaming_authorized(request).await?;
+        let response = match response.into_result().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.client
+                    .invalidate_access_token_if_rejected(&error, access_token.as_deref());
+                return Err(error);
+            }
+        };
+        let (mut bytes_stream, poison_handle) = response.into_stream();
+        let auth_client = self.client.clone();
 
         let mut buffer = BytesMut::new();
         let mut decoder = FrameDecoder;
 
         Ok(Box::pin(try_stream! {
+            let mut advice_seen = false;
+
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = chunk?;
                 buffer.extend_from_slice(&chunk);
@@ -499,10 +508,23 @@ impl BasinClient {
                 loop {
                     match decoder.decode(&mut buffer) {
                         Ok(Some(SessionMessage::Regular(msg))) => {
+                            if !advice_seen && msg.reconnect_advised() {
+                                advice_seen = true;
+                                poison_handle.poison();
+                                reconnect.advise();
+                            }
                             yield msg.try_into_proto()?;
                         }
                         Ok(Some(SessionMessage::Terminal(msg))) => {
-                            Err::<(), ApiError>(msg.into())?;
+                            let error: ApiError = msg.into();
+                            if error.is_server_draining() {
+                                poison_handle.poison();
+                            }
+                            auth_client.invalidate_access_token_if_rejected(
+                                &error,
+                                access_token.as_deref(),
+                            );
+                            Err::<(), ApiError>(error)?;
                         }
                         Ok(None) => break,
                         Err(err) => Err(err)?,
@@ -523,6 +545,7 @@ impl BasinClient {
         start: ReadStart,
         end: ReadEnd,
         encryption: Option<&EncryptionKey>,
+        reconnect: ReconnectAdvice,
     ) -> Result<Streaming<ReadBatch>, ApiError> {
         let url = self.uri(format!("v1/streams/{}/records", urlencoding::encode(name)));
 
@@ -537,18 +560,24 @@ impl BasinClient {
             add_basin_header_if_required(request_builder, &self.config.endpoints, &self.name);
         let mut request = request_builder.build()?;
         set_encryption_header(&mut request, encryption);
-        let response = self
-            .client
-            .init_streaming(request)
-            .await?
-            .into_result()
-            .await?;
-        let mut bytes_stream = response.stream();
+        let (response, access_token) = self.client.init_streaming_authorized(request).await?;
+        let response = match response.into_result().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.client
+                    .invalidate_access_token_if_rejected(&error, access_token.as_deref());
+                return Err(error);
+            }
+        };
+        let (mut bytes_stream, poison_handle) = response.into_stream();
+        let auth_client = self.client.clone();
 
         let mut buffer = BytesMut::new();
         let mut decoder = FrameDecoder;
 
         Ok(Box::pin(try_stream! {
+            let mut advice_seen = false;
+
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = chunk?;
                 buffer.extend_from_slice(&chunk);
@@ -556,10 +585,23 @@ impl BasinClient {
                 loop {
                     match decoder.decode(&mut buffer) {
                         Ok(Some(SessionMessage::Regular(msg))) => {
+                            if !advice_seen && msg.reconnect_advised() {
+                                advice_seen = true;
+                                poison_handle.poison();
+                                reconnect.advise();
+                            }
                             yield msg.try_into_proto()?;
                         }
                         Ok(Some(SessionMessage::Terminal(msg))) => {
-                            Err::<(), ApiError>(msg.into())?;
+                            let error: ApiError = msg.into();
+                            if error.is_server_draining() {
+                                poison_handle.poison();
+                            }
+                            auth_client.invalidate_access_token_if_rejected(
+                                &error,
+                                access_token.as_deref(),
+                            );
+                            Err::<(), ApiError>(error)?;
                         }
                         Ok(None) => break,
                         Err(err) => Err(err)?,
@@ -584,7 +626,7 @@ fn read_response_error_handler(
     } else {
         Err(ApiError::Server(
             status,
-            response.json::<ApiErrorResponse>()?,
+            response.json::<ServerErrorBody>()?,
         ))
     }
 }
@@ -599,21 +641,24 @@ impl Deref for BasinClient {
 
 #[derive(Debug, thiserror::Error, serde::Deserialize)]
 #[error("{code}: {message}")]
-pub struct ApiErrorResponse {
+pub(crate) struct ServerErrorBody {
     pub code: String,
     pub message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ApiError {
+pub(crate) enum ApiError {
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
     ProtoDecode(#[from] prost::DecodeError),
     #[error(transparent)]
-    S2STerminalDecode(#[from] S2STerminalDecodeError),
+    TerminalDecode(#[from] TerminalDecodeError),
     #[error("malformed access token: {0}")]
     MalformedAccessToken(String),
+    #[cfg(feature = "_hidden")]
+    #[error("access token provider failed: {0}")]
+    AccessTokenProvider(crate::types::AccessTokenProviderError),
     #[error(transparent)]
     Compression(#[from] std::io::Error),
     #[error("append condition check failed")]
@@ -621,172 +666,56 @@ pub enum ApiError {
     #[error("read from an unwritten position")]
     ReadUnwritten(TailResponse),
     #[error("{1}")]
-    Server(StatusCode, ApiErrorResponse),
+    Server(StatusCode, ServerErrorBody),
 }
 
 impl ApiError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Server(status, err_resp) => {
-                matches!(
-                    *status,
-                    StatusCode::REQUEST_TIMEOUT
-                        | StatusCode::TOO_MANY_REQUESTS
-                        | StatusCode::INTERNAL_SERVER_ERROR
-                        | StatusCode::BAD_GATEWAY
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::GATEWAY_TIMEOUT
-                ) || (*status == StatusCode::CONFLICT && err_resp.code == "transaction_conflict")
-            }
+            Self::Server(status, err_resp) => server_error_is_retryable(*status, &err_resp.code),
             Self::Client(err) => err.is_retryable(),
+            #[cfg(feature = "_hidden")]
+            Self::AccessTokenProvider(error) => error.is_retryable(),
             _ => false,
         }
     }
 
+    pub(crate) fn is_server_draining(&self) -> bool {
+        matches!(
+            self,
+            Self::Server(StatusCode::SERVICE_UNAVAILABLE, response)
+                if response.code == "server_draining"
+        )
+    }
+
+    pub(crate) fn is_authentication_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Server(StatusCode::UNAUTHORIZED, response) if response.code == "authn"
+        )
+    }
+
     pub fn has_no_side_effects(&self) -> bool {
         match self {
-            Self::Server(status, err_resp) => matches!(
-                (*status, err_resp.code.as_str()),
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
-                    | (StatusCode::BAD_GATEWAY, "hot_server")
-            ),
+            Self::Server(status, err_resp) => {
+                server_error_has_no_side_effects(*status, &err_resp.code)
+            }
             Self::Client(err) => err.has_no_side_effects(),
+            #[cfg(feature = "_hidden")]
+            Self::AccessTokenProvider(_) => true,
             _ => false,
         }
     }
 }
 
-impl From<client::Error> for ApiError {
-    fn from(err: client::Error) -> Self {
+impl From<client::HttpError> for ApiError {
+    fn from(err: client::HttpError) -> Self {
         ClientError::from(err).into()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    #[error("connect: {0}")]
-    Connect(String),
-    #[error("timeout")]
-    Timeout,
-    #[error("connection closed early: {0}")]
-    ConnectionClosedEarly(String),
-    #[error("request canceled: {0}")]
-    RequestCanceled(String),
-    #[error("unexpected eof: {0}")]
-    UnexpectedEof(String),
-    #[error("connection reset: {0}")]
-    ConnectionReset(String),
-    #[error("connection aborted: {0}")]
-    ConnectionAborted(String),
-    #[error("connection refused: {0}")]
-    ConnectionRefused(String),
-    #[error("{0}")]
-    Others(String),
-}
-
-impl ClientError {
-    pub fn is_retryable(&self) -> bool {
-        !matches!(self, ClientError::Others(_))
-    }
-
-    pub fn has_no_side_effects(&self) -> bool {
-        match self {
-            ClientError::Connect(_)
-            | ClientError::Timeout
-            | ClientError::ConnectionClosedEarly(_)
-            | ClientError::RequestCanceled(_)
-            | ClientError::UnexpectedEof(_)
-            | ClientError::ConnectionReset(_)
-            | ClientError::ConnectionAborted(_)
-            | ClientError::Others(_) => false,
-            ClientError::ConnectionRefused(_) => true,
-        }
-    }
-}
-
-impl From<client::Error> for ClientError {
-    fn from(err: client::Error) -> Self {
-        let err_msg = err.to_string();
-        match err {
-            client::Error::Send(ref send_err) if send_err.is_connect() => {
-                classify_io_source(&err, &err_msg)
-                    .or_else(|| classify_dns_source(&err, &err_msg))
-                    .unwrap_or(Self::Connect(err_msg))
-            }
-            client::Error::Send(_) | client::Error::Receive(_) => {
-                classify_hyper_source(&err, &err_msg)
-                    .or_else(|| classify_io_source(&err, &err_msg))
-                    .unwrap_or(Self::Others(err_msg))
-            }
-            client::Error::Timeout => Self::Timeout,
-            _ => Self::Others(err_msg),
-        }
-    }
-}
-
-fn classify_hyper_source(err: &client::Error, err_msg: &str) -> Option<ClientError> {
-    let hyper_err = source_err::<hyper::Error>(err)?;
-    let err_msg = format!("{hyper_err} -> {err_msg}");
-    if hyper_err.is_incomplete_message() {
-        Some(ClientError::ConnectionClosedEarly(err_msg))
-    } else if hyper_err.is_canceled() {
-        Some(ClientError::RequestCanceled(err_msg))
-    } else {
-        None
-    }
-}
-
-fn classify_io_source(err: &client::Error, err_msg: &str) -> Option<ClientError> {
-    let io_err = source_err::<std::io::Error>(err)?;
-    let err_msg = format!("{io_err} -> {err_msg}");
-    Some(match io_err.kind() {
-        std::io::ErrorKind::UnexpectedEof => ClientError::UnexpectedEof(err_msg),
-        std::io::ErrorKind::ConnectionReset => ClientError::ConnectionReset(err_msg),
-        std::io::ErrorKind::ConnectionAborted => ClientError::ConnectionAborted(err_msg),
-        std::io::ErrorKind::ConnectionRefused => ClientError::ConnectionRefused(err_msg),
-        _ => return None,
-    })
-}
-
-/// Walk the error source chain looking for a "dns error" tag.
-///
-/// hyper-util's `ConnectError` (not publicly exported, so we can't downcast)
-/// tags DNS failures with the static string "dns error" via `ConnectError::dns()`.
-/// This is not a platform-specific message — it's a structural tag from the
-/// Rust library. If the HTTP client changes, this will harmlessly stop matching
-/// and DNS errors will fall through to the generic `Connect` variant.
-fn classify_dns_source(err: &client::Error, _err_msg: &str) -> Option<ClientError> {
-    let mut source = Some(err as &dyn std::error::Error);
-    while let Some(err) = source {
-        if err.to_string() == "dns error" {
-            // Build the message from the DNS error's source (the actual
-            // resolver error) rather than the top-level hyper wrapper.
-            let detail = match err.source() {
-                Some(cause) => format!("dns resolution: {cause}"),
-                None => "dns resolution failed".to_owned(),
-            };
-            return Some(ClientError::Connect(detail));
-        }
-        source = err.source();
-    }
-    None
-}
-
-fn source_err<T: std::error::Error + 'static>(err: &dyn std::error::Error) -> Option<&T> {
-    let mut source = err.source();
-
-    while let Some(err) = source {
-        if let Some(err) = err.downcast_ref::<T>() {
-            return Some(err);
-        }
-
-        source = err.source();
-    }
-    None
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum S2STerminalDecodeError {
+pub(crate) enum TerminalDecodeError {
     #[error("invalid status code: {0}")]
     InvalidStatusCode(#[from] http::status::InvalidStatusCode),
     #[error("failed to parse error response: {0}")]
@@ -797,13 +726,13 @@ impl From<TerminalMessage> for ApiError {
     fn from(msg: TerminalMessage) -> Self {
         let status = match StatusCode::from_u16(msg.status) {
             Ok(status) => status,
-            Err(err) => return ApiError::S2STerminalDecode(err.into()),
+            Err(err) => return ApiError::TerminalDecode(err.into()),
         };
         if status == StatusCode::PRECONDITION_FAILED {
             let condition_failed = match serde_json::from_str::<AppendConditionFailed>(&msg.body) {
                 Ok(condition_failed) => condition_failed,
                 Err(err) => {
-                    return ApiError::S2STerminalDecode(err.into());
+                    return ApiError::TerminalDecode(err.into());
                 }
             };
             ApiError::AppendConditionFailed(condition_failed)
@@ -811,15 +740,15 @@ impl From<TerminalMessage> for ApiError {
             let tail = match serde_json::from_str::<TailResponse>(&msg.body) {
                 Ok(tail) => tail,
                 Err(err) => {
-                    return ApiError::S2STerminalDecode(err.into());
+                    return ApiError::TerminalDecode(err.into());
                 }
             };
             ApiError::ReadUnwritten(tail)
         } else {
-            let response = match serde_json::from_str::<ApiErrorResponse>(&msg.body) {
+            let response = match serde_json::from_str::<ServerErrorBody>(&msg.body) {
                 Ok(response) => response,
                 Err(err) => {
-                    return ApiError::S2STerminalDecode(err.into());
+                    return ApiError::TerminalDecode(err.into());
                 }
             };
             ApiError::Server(status, response)
@@ -829,10 +758,20 @@ impl From<TerminalMessage> for ApiError {
 
 pub type Streaming<R> = Pin<Box<dyn Send + Stream<Item = Result<R, ApiError>>>>;
 
+fn authorization_header(access_token: &str) -> Result<HeaderValue, ApiError> {
+    let mut header = HeaderValue::try_from(format!("Bearer {access_token}"))
+        .map_err(|error| ApiError::MalformedAccessToken(error.to_string()))?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
 #[derive(Clone)]
 pub struct BaseClient {
     client: Arc<dyn client::RequestExecutor>,
     default_headers: HeaderMap,
+    access_token_mode: AccessTokenMode,
+    #[cfg(feature = "_hidden")]
+    access_token_provider: Option<Arc<dyn crate::types::AccessTokenProvider>>,
     request_timeout: Duration,
     retry_builder: RetryBackoffBuilder,
     compression: Compression,
@@ -851,7 +790,9 @@ impl BaseClient {
             config.insecure_skip_cert_verification,
             config.rustls_crypto_provider.clone(),
         )
-        .map_err(|e| ClientError::Others(format!("failed to initialize TLS connector: {e}")))?;
+        .map_err(|e| {
+            ClientError::Configuration(format!("failed to initialize TLS connector: {e}"))
+        })?;
         Self::init_with_connector(config, connector)
     }
 
@@ -859,12 +800,22 @@ impl BaseClient {
     where
         C: client::Connect + Clone + Send + Sync + 'static,
     {
+        let access_token_mode = config.access_token.mode();
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            AUTHORIZATION,
-            HeaderValue::try_from(format!("Bearer {}", config.access_token.expose_secret()))
-                .map_err(|e| ApiError::MalformedAccessToken(e.to_string()))?,
-        );
+        #[cfg(feature = "_hidden")]
+        let mut access_token_provider = None;
+        match &config.access_token {
+            AccessToken::Static(access_token) => {
+                default_headers.insert(
+                    AUTHORIZATION,
+                    authorization_header(access_token.expose_secret())?,
+                );
+            }
+            #[cfg(feature = "_hidden")]
+            AccessToken::Provider(provider) => {
+                access_token_provider = Some(provider.clone());
+            }
+        }
         default_headers.insert(http::header::USER_AGENT, config.user_agent.clone());
         match config.compression {
             Compression::Gzip => {
@@ -887,6 +838,9 @@ impl BaseClient {
         Ok(Self {
             client: Arc::new(client),
             default_headers,
+            access_token_mode,
+            #[cfg(feature = "_hidden")]
+            access_token_provider,
             request_timeout: config.request_timeout,
             retry_builder: retry_builder(&config.retry),
             compression: config.compression,
@@ -929,15 +883,72 @@ impl BaseClient {
     pub async fn init_streaming(
         &self,
         request: client::Request,
-    ) -> Result<StreamingResponse, client::Error> {
+    ) -> Result<StreamingResponse, client::HttpError> {
         self.client.init_streaming(request).await
+    }
+
+    #[cfg(not(feature = "_hidden"))]
+    async fn init_streaming_authorized(
+        &self,
+        request: client::Request,
+    ) -> Result<(StreamingResponse, Option<String>), ApiError> {
+        self.init_streaming(request)
+            .await
+            .map(|response| (response, None))
+            .map_err(ApiError::from)
+    }
+
+    #[cfg(feature = "_hidden")]
+    async fn init_streaming_authorized(
+        &self,
+        mut request: client::Request,
+    ) -> Result<(StreamingResponse, Option<String>), ApiError> {
+        let access_token = self.authorize(&mut request).await?;
+        let response = self.init_streaming(request).await.map_err(ApiError::from)?;
+        Ok((response, access_token))
     }
 
     async fn execute_unary(
         &self,
-        request: client::Request,
-    ) -> Result<UnaryResponse, client::Error> {
-        self.client.execute_unary(request).await
+        mut request: client::Request,
+    ) -> Result<(UnaryResponse, Option<String>), ApiError> {
+        let access_token = self.authorize(&mut request).await?;
+        let response = self
+            .client
+            .execute_unary(request)
+            .await
+            .map_err(ApiError::from)?;
+        Ok((response, access_token))
+    }
+
+    async fn authorize(&self, _request: &mut client::Request) -> Result<Option<String>, ApiError> {
+        #[cfg(feature = "_hidden")]
+        if let Some(provider) = self.access_token_provider.as_ref() {
+            let access_token = provider
+                .access_token()
+                .await
+                .map_err(ApiError::AccessTokenProvider)?;
+            _request
+                .headers_mut()
+                .insert(AUTHORIZATION, authorization_header(&access_token)?);
+            return Ok(Some(access_token));
+        }
+        Ok(None)
+    }
+
+    fn invalidate_access_token(&self, _access_token: Option<&str>) {
+        #[cfg(feature = "_hidden")]
+        if let (Some(provider), Some(access_token)) =
+            (self.access_token_provider.as_ref(), _access_token)
+        {
+            provider.invalidate_access_token(access_token);
+        }
+    }
+
+    fn invalidate_access_token_if_rejected(&self, error: &ApiError, access_token: Option<&str>) {
+        if error.is_authentication_error() {
+            self.invalidate_access_token(access_token);
+        }
     }
 
     fn request(&self, request: client::Request) -> RequestBuilder<'_> {
@@ -1035,8 +1046,8 @@ impl<'a> RequestBuilder<'a> {
 
             let response = self.client.execute_unary(attempt_request).await;
 
-            let (err, retry_after) = match response {
-                Ok(resp) => {
+            let (err, retry_after, access_token) = match response {
+                Ok((resp, access_token)) => {
                     let retry_after: Option<Duration> = resp
                         .headers()
                         .get(RETRY_AFTER_MS_HEADER)
@@ -1069,15 +1080,24 @@ impl<'a> RequestBuilder<'a> {
                         Ok(resp) => {
                             return Ok(resp);
                         }
-                        Err(err) if err.is_retryable() => (err, retry_after),
-                        Err(err) => return Err(err),
+                        Err(err) => (err, retry_after, access_token),
                     }
                 }
-                Err(err) => (ApiError::from(err), None),
+                Err(err) => (err, None, None),
             };
 
-            if is_safe_to_retry(&err, self.append_retry_policy, self.frame_signal.as_ref())
-                && let Some(backoff) = retry_backoff.as_mut().and_then(|b| b.next())
+            let refreshable_authentication_error =
+                self.client.access_token_mode.is_refreshable() && err.is_authentication_error();
+            if refreshable_authentication_error {
+                self.client.invalidate_access_token(access_token.as_deref());
+            }
+
+            if is_safe_to_retry(
+                &err,
+                self.append_retry_policy,
+                self.frame_signal.as_ref(),
+                self.client.access_token_mode,
+            ) && let Some(backoff) = retry_backoff.as_mut().and_then(|b| b.next())
             {
                 let backoff = retry_after.map_or(backoff, |ra| ra.max(backoff));
                 debug!(
@@ -1090,7 +1110,7 @@ impl<'a> RequestBuilder<'a> {
             } else {
                 debug!(
                     %err,
-                    is_retryable = err.is_retryable(),
+                    is_retryable = err.is_retryable() || refreshable_authentication_error,
                     retry_enabled = self.retry_enabled,
                     retries_exhausted = retry_backoff.as_ref().is_none_or(|b| b.is_exhausted()),
                     "not retrying request"
@@ -1105,6 +1125,7 @@ fn is_safe_to_retry(
     err: &ApiError,
     policy: Option<AppendRetryPolicy>,
     frame_signal: Option<&FrameSignal>,
+    access_token_mode: AccessTokenMode,
 ) -> bool {
     let policy_compliant = match policy {
         None | Some(AppendRetryPolicy::All) => true,
@@ -1112,7 +1133,9 @@ fn is_safe_to_retry(
             !frame_signal.is_none_or(|s| s.is_signalled()) || err.has_no_side_effects()
         }
     };
-    policy_compliant && err.is_retryable()
+    policy_compliant
+        && (err.is_retryable()
+            || (access_token_mode.is_refreshable() && err.is_authentication_error()))
 }
 
 fn add_basin_header_if_required(
@@ -1164,7 +1187,7 @@ impl UnaryResult for UnaryResponse {
         if status.is_success() {
             Ok(self)
         } else {
-            Err(ApiError::Server(status, self.json::<ApiErrorResponse>()?))
+            Err(ApiError::Server(status, self.json::<ServerErrorBody>()?))
         }
     }
 
@@ -1194,17 +1217,23 @@ impl StreamingResult for StreamingResponse {
         }
 
         let status = self.status();
-        let bytes = self.into_bytes().await?;
+        let (bytes, poison_handle) = self.into_bytes_with_poison_handle().await?;
         if status == StatusCode::RANGE_NOT_SATISFIABLE
             && let Ok(tail) = serde_json::from_slice::<TailResponse>(&bytes)
         {
             return Err(ApiError::ReadUnwritten(tail));
         }
-        match serde_json::from_slice::<ApiErrorResponse>(&bytes) {
-            Ok(response) => Err(ApiError::Server(status, response)),
-            Err(_) => Err(ApiError::Client(ClientError::Others(format!(
-                "server error {status}: {}",
-                String::from_utf8_lossy(&bytes)
+        match serde_json::from_slice::<ServerErrorBody>(&bytes) {
+            Ok(response) => {
+                let error = ApiError::Server(status, response);
+                if error.is_server_draining() {
+                    poison_handle.poison();
+                }
+                Err(error)
+            }
+            Err(error) => Err(ApiError::Client(ClientError::ResponseDecode(format!(
+                "could not decode server error {status}: {error}; body: {}",
+                String::from_utf8_lossy(&bytes),
             )))),
         }
     }
@@ -1248,17 +1277,108 @@ fn provision_result_from_parts<T>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "_hidden")]
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[cfg(feature = "_hidden")]
+    use async_trait::async_trait;
+    #[cfg(feature = "_hidden")]
+    use hyper_util::client::legacy::connect::HttpConnector;
+
     use super::*;
 
-    /// Verify that DNS resolution failures produce a clear error message
-    /// containing "dns resolution" rather than the opaque hyper wrapper.
-    /// This also serves as a regression test: if hyper-util changes its
-    /// internal "dns error" tag, this test will fail, signaling that
-    /// `classify_dns_source` needs updating.
+    #[cfg(feature = "_hidden")]
+    #[derive(Debug)]
+    struct RotatingTokenProvider {
+        generation: AtomicUsize,
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[async_trait]
+    impl crate::types::AccessTokenProvider for RotatingTokenProvider {
+        async fn access_token(&self) -> Result<String, crate::types::AccessTokenProviderError> {
+            let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+            Ok(format!("token-{generation}"))
+        }
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[derive(Debug)]
+    struct RejectAwareTokenProvider {
+        invalidated: AtomicBool,
+        rejected: Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[async_trait]
+    impl crate::types::AccessTokenProvider for RejectAwareTokenProvider {
+        async fn access_token(&self) -> Result<String, crate::types::AccessTokenProviderError> {
+            Ok(if self.invalidated.load(Ordering::Acquire) {
+                "new-token"
+            } else {
+                "old-token"
+            }
+            .to_owned())
+        }
+
+        fn invalidate_access_token(&self, rejected_access_token: &str) {
+            self.rejected
+                .lock()
+                .expect("rejected token mutex poisoned")
+                .push(rejected_access_token.to_owned());
+            self.invalidated.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[derive(Debug, Default)]
+    struct RejectOldTokenExecutor {
+        authorization_headers: Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[async_trait]
+    impl client::RequestExecutor for RejectOldTokenExecutor {
+        async fn execute_unary(
+            &self,
+            mut request: client::Request,
+        ) -> Result<UnaryResponse, client::HttpError> {
+            let authorization = request
+                .headers_mut()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            self.authorization_headers
+                .lock()
+                .expect("authorization header mutex poisoned")
+                .push(authorization.clone());
+
+            if authorization == "Bearer old-token" {
+                Ok(UnaryResponse::new_for_test(
+                    StatusCode::UNAUTHORIZED,
+                    br#"{"code":"authn","message":"rejected"}"#.to_vec(),
+                ))
+            } else {
+                Ok(UnaryResponse::new_for_test(StatusCode::OK, "ok"))
+            }
+        }
+
+        async fn init_streaming(
+            &self,
+            _request: client::Request,
+        ) -> Result<StreamingResponse, client::HttpError> {
+            unreachable!("unary retry test does not initialize a stream")
+        }
+    }
+
     fn server_error(status: StatusCode, code: &str) -> ApiError {
         ApiError::Server(
             status,
-            ApiErrorResponse {
+            ServerErrorBody {
                 code: code.to_owned(),
                 message: "test".to_owned(),
             },
@@ -1266,43 +1386,14 @@ mod tests {
     }
 
     #[test]
-    fn api_error_has_no_side_effects() {
-        // Server errors that guarantee no mutation.
-        assert!(server_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").has_no_side_effects());
-        assert!(server_error(StatusCode::BAD_GATEWAY, "hot_server").has_no_side_effects());
-
-        // Server errors that do NOT guarantee no mutation.
-        assert!(!server_error(StatusCode::INTERNAL_SERVER_ERROR, "internal").has_no_side_effects());
-        assert!(!server_error(StatusCode::BAD_GATEWAY, "other").has_no_side_effects());
-        assert!(
-            !server_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable").has_no_side_effects()
-        );
-    }
-
-    #[test]
-    fn client_error_has_no_side_effects() {
-        // Connection was never established.
-        assert!(ClientError::ConnectionRefused("test".into()).has_no_side_effects());
-
-        // May have side effects — data could have been sent/processed.
-        assert!(!ClientError::Connect("test".into()).has_no_side_effects());
-        assert!(!ClientError::Timeout.has_no_side_effects());
-        assert!(!ClientError::ConnectionClosedEarly("test".into()).has_no_side_effects());
-        assert!(!ClientError::RequestCanceled("test".into()).has_no_side_effects());
-        assert!(!ClientError::UnexpectedEof("test".into()).has_no_side_effects());
-        assert!(!ClientError::ConnectionReset("test".into()).has_no_side_effects());
-        assert!(!ClientError::ConnectionAborted("test".into()).has_no_side_effects());
-        assert!(!ClientError::Others("test".into()).has_no_side_effects());
-    }
-
-    #[test]
     fn safe_to_retry_unary_no_policy() {
         let retryable = server_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         let non_retryable = server_error(StatusCode::BAD_REQUEST, "bad_request");
+        let mode = AccessTokenMode::Static;
 
         // Non-append requests (no policy) — retry if retryable.
-        assert!(is_safe_to_retry(&retryable, None, None));
-        assert!(!is_safe_to_retry(&non_retryable, None, None));
+        assert!(is_safe_to_retry(&retryable, None, None, mode));
+        assert!(!is_safe_to_retry(&non_retryable, None, None, mode));
     }
 
     #[test]
@@ -1310,10 +1401,11 @@ mod tests {
         let retryable = server_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         let non_retryable = server_error(StatusCode::BAD_REQUEST, "bad_request");
         let policy = Some(AppendRetryPolicy::All);
+        let mode = AccessTokenMode::Static;
 
         // All policy — retry if retryable, no frame signal checks.
-        assert!(is_safe_to_retry(&retryable, policy, None));
-        assert!(!is_safe_to_retry(&non_retryable, policy, None));
+        assert!(is_safe_to_retry(&retryable, policy, None, mode));
+        assert!(!is_safe_to_retry(&non_retryable, policy, None, mode));
     }
 
     #[test]
@@ -1321,26 +1413,129 @@ mod tests {
         let retryable = server_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         let non_retryable = server_error(StatusCode::BAD_REQUEST, "bad_request");
         let no_side_effect = server_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        let transaction_conflict = server_error(StatusCode::CONFLICT, "transaction_conflict");
         let policy = Some(AppendRetryPolicy::NoSideEffects);
         let signal = FrameSignal::new();
+        let mode = AccessTokenMode::Static;
 
         // Signal not set — safe to retry.
-        assert!(is_safe_to_retry(&retryable, policy, Some(&signal)));
+        assert!(is_safe_to_retry(&retryable, policy, Some(&signal), mode));
 
         // Signal set + error with possible side effects — not safe.
         signal.signal();
-        assert!(!is_safe_to_retry(&retryable, policy, Some(&signal)));
+        assert!(!is_safe_to_retry(&retryable, policy, Some(&signal), mode));
 
         // Signal set + no-side-effect error — safe.
-        assert!(is_safe_to_retry(&no_side_effect, policy, Some(&signal)));
+        assert!(is_safe_to_retry(
+            &no_side_effect,
+            policy,
+            Some(&signal),
+            mode,
+        ));
+        assert!(is_safe_to_retry(
+            &transaction_conflict,
+            policy,
+            Some(&signal),
+            mode,
+        ));
 
         // Signal set + non-retryable — never safe.
-        assert!(!is_safe_to_retry(&non_retryable, policy, Some(&signal)));
+        assert!(!is_safe_to_retry(
+            &non_retryable,
+            policy,
+            Some(&signal),
+            mode,
+        ));
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn dynamic_access_token_is_loaded_for_each_attempt_and_marked_sensitive() {
+        let config = S2Config::new("unused").with_access_token_provider(RotatingTokenProvider {
+            generation: AtomicUsize::new(1),
+        });
+        let client = BaseClient::init_with_connector(&config, HttpConnector::new()).unwrap();
+        let uri = "http://example.test/v1/basins".parse().unwrap();
+        let mut request = client.get(uri).build().unwrap();
+
+        assert!(request.headers_mut().get(AUTHORIZATION).is_none());
+
+        client.authorize(&mut request).await.unwrap();
+        let first = request.headers_mut().get(AUTHORIZATION).unwrap();
+        assert_eq!(first, "Bearer token-1");
+        assert!(first.is_sensitive());
+
+        client.authorize(&mut request).await.unwrap();
+        let second = request.headers_mut().get(AUTHORIZATION).unwrap();
+        assert_eq!(second, "Bearer token-2");
+        assert!(second.is_sensitive());
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[tokio::test]
+    async fn rejected_token_is_invalidated_and_replaced_on_unary_retry() {
+        let provider = Arc::new(RejectAwareTokenProvider {
+            invalidated: AtomicBool::new(false),
+            rejected: Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(RejectOldTokenExecutor::default());
+        let client = BaseClient {
+            client: executor.clone(),
+            default_headers: HeaderMap::new(),
+            access_token_mode: AccessTokenMode::Refreshable,
+            access_token_provider: Some(provider.clone()),
+            request_timeout: Duration::from_secs(1),
+            retry_builder: RetryBackoffBuilder::default()
+                .with_min_base_delay(Duration::ZERO)
+                .with_max_base_delay(Duration::ZERO)
+                .with_max_retries(1),
+            compression: Compression::None,
+        };
+        let request = client
+            .get("http://example.test/v1/basins".parse().unwrap())
+            .build()
+            .unwrap();
+
+        let response = client.request(request).send().await.unwrap();
+
+        assert_eq!(response.into_bytes(), bytes::Bytes::from_static(b"ok"));
+        assert_eq!(
+            executor
+                .authorization_headers
+                .lock()
+                .expect("authorization header mutex poisoned")
+                .as_slice(),
+            ["Bearer old-token", "Bearer new-token"]
+        );
+        assert_eq!(
+            provider
+                .rejected
+                .lock()
+                .expect("rejected token mutex poisoned")
+                .as_slice(),
+            ["old-token"]
+        );
+    }
+
+    #[cfg(feature = "_hidden")]
+    #[test]
+    fn transient_provider_failures_are_retryable_without_side_effects() {
+        let transient = ApiError::AccessTokenProvider(
+            crate::types::AccessTokenProviderError::transient("temporarily unavailable"),
+        );
+        assert!(transient.is_retryable());
+        assert!(transient.has_no_side_effects());
+
+        let permanent = ApiError::AccessTokenProvider(
+            crate::types::AccessTokenProviderError::permanent("login required"),
+        );
+        assert!(!permanent.is_retryable());
+        assert!(permanent.has_no_side_effects());
     }
 
     #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
     #[tokio::test]
-    async fn dns_error_message_is_clear() {
+    async fn dns_errors_are_classified_as_connect() {
         let config = crate::types::S2Config::new("test-token".to_owned())
             .with_endpoints(
                 crate::types::S2Endpoints::new(
@@ -1361,10 +1556,9 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("should fail with DNS error"),
         };
-        let msg = err.to_string();
         assert!(
-            msg.contains("dns resolution"),
-            "expected 'dns resolution' in error, got: {msg}"
+            matches!(&err, ApiError::Client(ClientError::Connect(_))),
+            "expected a connect error, got: {err}"
         );
     }
 }
