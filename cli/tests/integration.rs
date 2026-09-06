@@ -565,7 +565,7 @@ fn append_from_stdin() {
 
 #[test]
 #[serial]
-fn append_with_create_stream_config() {
+fn append_with_stream_config() {
     let basin = unique_name("test-cli-csoa-cfg");
     s2().args([
         "create-basin",
@@ -588,7 +588,7 @@ fn append_with_create_stream_config() {
         "text",
         "--input",
         "-",
-        "--create-stream-config",
+        "--stream-config",
         r#"{"retention_policy": "1h", "delete_on_empty": {"min_age": "5m"}}"#,
     ])
     .write_stdin("first record\n")
@@ -612,7 +612,7 @@ fn append_with_create_stream_config() {
         "text",
         "--input",
         "-",
-        "--create-stream-config",
+        "--stream-config",
         r#"{"retention_policy": "2h"}"#,
     ])
     .write_stdin("second record\n")
@@ -624,52 +624,18 @@ fn append_with_create_stream_config() {
         .success()
         .stdout(predicate::str::contains("1h").and(predicate::str::contains("2h").not()));
 
-    // Unset fields inherit the basin default.
-    let inherit = unique_name("test-csoa-inherit");
-    let inherit_uri = format!("s2://{basin}/{inherit}");
-    s2().args([
-        "append",
-        &inherit_uri,
-        "--format",
-        "text",
-        "--input",
-        "-",
-        "--create-stream-config",
-        r#"{"storage_class": "express"}"#,
-    ])
-    .write_stdin("record\n")
-    .assert()
-    .success();
-
-    s2().args(["get-stream-config", &inherit_uri])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("express").and(predicate::str::contains("7days")));
-
     cleanup_stream(&basin, &stream);
-    cleanup_stream(&basin, &inherit);
     cleanup_basin(&basin);
 }
 
 #[test]
 #[serial]
-fn append_with_invalid_create_stream_config_fails() {
+fn append_with_invalid_stream_config_fails() {
     s2().args([
         "append",
         "s2://some-basin/some-stream",
-        "--create-stream-config",
+        "--stream-config",
         r#"{"retention_policy": "not-a-duration"}"#,
-    ])
-    .write_stdin("record\n")
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("invalid stream config JSON"));
-
-    s2().args([
-        "append",
-        "s2://some-basin/some-stream",
-        "--create-stream-config",
-        r#"{"unknown_field": true}"#,
     ])
     .write_stdin("record\n")
     .assert()

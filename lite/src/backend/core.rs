@@ -325,14 +325,14 @@ impl Backend {
 
     /// Resolve a handle for `stream`, creating it on demand if the basin config allows.
     ///
-    /// `create_stream_config` is layered over the basin's default stream config only if the
-    /// stream is actually being created. It must already be validated.
+    /// `stream_config` is applied over the basin's default stream configuration only if the
+    /// stream is being created. It must already be validated.
     pub(super) async fn stream_handle_with_auto_create<E>(
         &self,
         basin: &BasinName,
         stream: &StreamName,
         auto_create_on: AutoCreateOn,
-        create_stream_config: OptionalStreamConfig,
+        stream_config: OptionalStreamConfig,
         resolve_encryption: impl FnOnce(Option<EncryptionAlgorithm>) -> Result<EncryptionSpec, E>,
     ) -> Result<StreamHandle, E>
     where
@@ -359,7 +359,7 @@ impl Backend {
                     .provision_stream(
                         basin.clone(),
                         stream.clone(),
-                        create_stream_config,
+                        stream_config,
                         ProvisionMode::CreateOnly {
                             request_token: None,
                         },

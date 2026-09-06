@@ -229,16 +229,18 @@ pub enum AppendRequest {
     /// Unary
     Unary {
         encryption_key: Option<EncryptionKey>,
-        /// From the `s2-stream-config` header; empty when absent.
-        create_stream_config: OptionalStreamConfig,
+        /// Stream configuration to apply if the stream is created on append, from the
+        /// `s2-stream-config` header.
+        stream_config: OptionalStreamConfig,
         input: s2_common::stream::AppendInput,
         response_mime: JsonOrProto,
     },
     /// S2S bi-directional streaming
     S2s {
         encryption_key: Option<EncryptionKey>,
-        /// From the `s2-stream-config` header; empty when absent.
-        create_stream_config: OptionalStreamConfig,
+        /// Stream configuration to apply if the stream is created on append, from the
+        /// `s2-stream-config` header.
+        stream_config: OptionalStreamConfig,
         inputs: BoxStream<'static, Result<s2_common::stream::AppendInput, AppendInputStreamError>>,
         response_compression: s2s::CompressionAlgorithm,
     },
@@ -249,25 +251,25 @@ impl std::fmt::Debug for AppendRequest {
         match self {
             AppendRequest::Unary {
                 encryption_key,
-                create_stream_config,
+                stream_config,
                 input,
                 response_mime: response,
             } => f
                 .debug_struct("AppendRequest::Unary")
                 .field("encryption_key", encryption_key)
-                .field("create_stream_config", create_stream_config)
+                .field("stream_config", stream_config)
                 .field("input", input)
                 .field("response", response)
                 .finish(),
             AppendRequest::S2s {
                 encryption_key,
-                create_stream_config,
+                stream_config,
                 response_compression,
                 ..
             } => f
                 .debug_struct("AppendRequest::S2s")
                 .field("encryption_key", encryption_key)
-                .field("create_stream_config", create_stream_config)
+                .field("stream_config", stream_config)
                 .field("response_compression", response_compression)
                 .finish(),
         }

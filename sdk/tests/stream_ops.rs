@@ -1956,7 +1956,7 @@ async fn producer_for_non_existent_stream_errors(basin: &SharedS2Basin) -> Resul
 }
 
 #[tokio::test]
-async fn create_stream_config_applies_only_when_append_creates_stream() -> Result<(), S2Error> {
+async fn stream_config_applies_only_when_append_creates_stream() -> Result<(), S2Error> {
     let s2 = s2();
     let basin_name = unique_basin_name();
     s2.create_basin(
@@ -1971,7 +1971,7 @@ async fn create_stream_config_applies_only_when_append_creates_stream() -> Resul
     .await?;
     let basin = s2.basin(basin_name.clone());
 
-    let create_stream_config = StreamConfig::new()
+    let stream_config = StreamConfig::new()
         .with_retention_policy(RetentionPolicy::Age(3600))
         .with_delete_on_empty(DeleteOnEmptyConfig::new().with_min_age(Duration::from_secs(300)));
 
@@ -1979,7 +1979,7 @@ async fn create_stream_config_applies_only_when_append_creates_stream() -> Resul
     let unary_stream = unique_stream_name();
     basin
         .stream(unary_stream.clone())
-        .with_create_stream_config(create_stream_config.clone())
+        .with_stream_config(stream_config.clone())
         .append(AppendInput::new(AppendRecordBatch::try_from_iter([
             AppendRecord::new("hello")?,
         ])?))
@@ -2002,7 +2002,7 @@ async fn create_stream_config_applies_only_when_append_creates_stream() -> Resul
     let session_stream = unique_stream_name();
     let producer = basin
         .stream(session_stream.clone())
-        .with_create_stream_config(create_stream_config.clone())
+        .with_stream_config(stream_config.clone())
         .producer(ProducerConfig::default());
     producer.submit(AppendRecord::new("hello")?).await?.await?;
     producer.close().await?;
@@ -2027,7 +2027,7 @@ async fn create_stream_config_applies_only_when_append_creates_stream() -> Resul
     let before = basin.get_stream_config(existing_stream.clone()).await?;
     basin
         .stream(existing_stream.clone())
-        .with_create_stream_config(create_stream_config)
+        .with_stream_config(stream_config)
         .append(AppendInput::new(AppendRecordBatch::try_from_iter([
             AppendRecord::new("hello")?,
         ])?))

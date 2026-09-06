@@ -294,7 +294,7 @@ impl S2Basin {
             client: self.client.clone(),
             name,
             encryption: None,
-            create_stream_config: None,
+            stream_config: None,
         }
     }
 
@@ -417,7 +417,7 @@ pub struct S2Stream {
     client: BasinClient,
     name: StreamName,
     encryption: Option<EncryptionKey>,
-    create_stream_config: Option<StreamConfig>,
+    stream_config: Option<StreamConfig>,
 }
 
 impl S2Stream {
@@ -429,27 +429,25 @@ impl S2Stream {
         }
     }
 
-    /// Set the stream configuration to apply if an append from this handle creates the stream.
+    /// Set the stream configuration to apply if the stream is created on append.
     ///
-    /// Sent as the `s2-stream-config` header on appends and append sessions. Only takes
-    /// effect when the basin has `create_stream_on_append` enabled and the stream does not exist
-    /// yet; unset fields inherit the basin's default stream configuration. Ignored if the stream
-    /// exists.
-    pub fn with_create_stream_config(self, create_stream_config: StreamConfig) -> Self {
+    /// Unset fields inherit the basin's default stream configuration. Ignored if the stream
+    /// already exists. Sent as the `s2-stream-config` header on appends and append sessions.
+    pub fn with_stream_config(self, stream_config: StreamConfig) -> Self {
         Self {
-            create_stream_config: Some(create_stream_config),
+            stream_config: Some(stream_config),
             ..self
         }
     }
 
-    fn api_create_stream_config(&self) -> Option<s2_api::v1::config::StreamConfig> {
-        self.create_stream_config.clone().map(Into::into)
+    fn api_stream_config(&self) -> Option<s2_api::v1::config::StreamConfig> {
+        self.stream_config.clone().map(Into::into)
     }
 
     fn append_headers(&self) -> AppendHeaders {
         AppendHeaders {
             encryption: self.encryption.clone(),
-            create_stream_config: self.api_create_stream_config(),
+            stream_config: self.api_stream_config(),
         }
     }
 
@@ -467,7 +465,7 @@ impl S2Stream {
                 &self.name,
                 input.into(),
                 self.encryption.as_ref(),
-                self.api_create_stream_config().as_ref(),
+                self.api_stream_config().as_ref(),
                 self.client.config.retry.append_retry_policy,
             )
             .await?;

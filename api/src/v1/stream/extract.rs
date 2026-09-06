@@ -54,7 +54,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let content_type = crate::mime::content_type(req.headers());
         let encryption_key = parse_header_opt::<EncryptionKey>(req.headers())?;
-        let create_stream_config = parse_header_opt::<StreamConfigHeader>(req.headers())?
+        let stream_config = parse_header_opt::<StreamConfigHeader>(req.headers())?
             .map(|header| header.0)
             .unwrap_or_default();
 
@@ -91,7 +91,7 @@ where
 
             return Ok(Self::S2s {
                 encryption_key,
-                create_stream_config,
+                stream_config,
                 inputs: Box::pin(inputs),
                 response_compression,
             });
@@ -121,7 +121,7 @@ where
 
         Ok(Self::Unary {
             encryption_key,
-            create_stream_config,
+            stream_config,
             input,
             response_mime,
         })

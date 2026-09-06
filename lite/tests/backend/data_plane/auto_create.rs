@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::TryStreamExt as _;
 use s2_common::{
     basin::BasinName,
     config::{
@@ -139,7 +138,7 @@ fn basin_config_with_defaults() -> BasinConfig {
     }
 }
 
-fn requested_create_stream_config() -> OptionalStreamConfig {
+fn requested_stream_config() -> OptionalStreamConfig {
     OptionalStreamConfig {
         retention_policy: Some(RetentionPolicy::Age(Duration::from_secs(3600))),
         delete_on_empty: OptionalDeleteOnEmptyConfig {
@@ -149,7 +148,7 @@ fn requested_create_stream_config() -> OptionalStreamConfig {
     }
 }
 
-/// The config a stream should end up with when `requested_create_stream_config` is layered
+/// The config a stream should end up with when `requested_stream_config` is layered
 /// over `basin_config_with_defaults`.
 fn expected_merged_stream_config() -> StreamConfig {
     StreamConfig {
@@ -163,7 +162,7 @@ fn expected_merged_stream_config() -> StreamConfig {
 }
 
 #[tokio::test]
-async fn test_backend_append_auto_create_applies_create_stream_config() {
+async fn test_backend_append_auto_create_applies_stream_config() {
     let backend = create_backend().await;
     let basin_name = create_test_basin(
         &backend,
@@ -179,12 +178,7 @@ async fn test_backend_append_auto_create_applies_create_stream_config() {
         fencing_token: None,
     };
     let ack = backend
-        .open_for_append(
-            &basin_name,
-            &stream_name,
-            None,
-            requested_create_stream_config(),
-        )
+        .open_for_append(&basin_name, &stream_name, None, requested_stream_config())
         .await
         .expect("Failed to open append handle")
         .append(input)
@@ -200,7 +194,7 @@ async fn test_backend_append_auto_create_applies_create_stream_config() {
 }
 
 #[tokio::test]
-async fn test_backend_append_ignores_create_stream_config_for_existing_stream() {
+async fn test_backend_append_ignores_stream_config_for_existing_stream() {
     let backend = create_backend().await;
     let basin_name = create_test_basin(
         &backend,
@@ -226,12 +220,7 @@ async fn test_backend_append_ignores_create_stream_config_for_existing_stream() 
         fencing_token: None,
     };
     backend
-        .open_for_append(
-            &basin_name,
-            &stream_name,
-            None,
-            requested_create_stream_config(),
-        )
+        .open_for_append(&basin_name, &stream_name, None, requested_stream_config())
         .await
         .expect("Failed to open append handle")
         .append(input)
@@ -244,48 +233,6 @@ async fn test_backend_append_ignores_create_stream_config_for_existing_stream() 
         .expect("Failed to get stream config");
     assert_eq!(after, before);
     assert_ne!(after, expected_merged_stream_config());
-}
-
-#[tokio::test]
-async fn test_backend_append_session_auto_create_applies_create_stream_config() {
-    let backend = create_backend().await;
-    let basin_name = create_test_basin(
-        &backend,
-        "backend-auto-create-session-config",
-        basin_config_with_defaults(),
-    )
-    .await;
-    let stream_name = test_stream_name("missing");
-
-    let input = |body: &'static [u8]| AppendInput {
-        records: create_test_record_batch(vec![Bytes::from_static(body)]),
-        match_seq_num: None,
-        fencing_token: None,
-    };
-    let acks: Vec<_> = backend
-        .open_for_append(
-            &basin_name,
-            &stream_name,
-            None,
-            requested_create_stream_config(),
-        )
-        .await
-        .expect("Failed to open append session")
-        .append_session(futures::stream::iter(vec![
-            input(b"first"),
-            input(b"second"),
-        ]))
-        .try_collect()
-        .await
-        .expect("Failed to append in session");
-    assert_eq!(acks.len(), 2);
-    assert_eq!(acks[1].end.seq_num, 2);
-
-    let config = backend
-        .get_stream_config(basin_name.clone(), stream_name.clone())
-        .await
-        .expect("Failed to get stream config");
-    assert_eq!(config, expected_merged_stream_config());
 }
 
 #[tokio::test]

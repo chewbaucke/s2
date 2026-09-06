@@ -385,12 +385,12 @@ pub async fn append(
     match request {
         v1t::stream::AppendRequest::Unary {
             encryption_key,
-            create_stream_config,
+            stream_config,
             input,
             response_mime,
         } => {
             let handle = backend
-                .open_for_append(&basin, &stream, encryption_key, create_stream_config)
+                .open_for_append(&basin, &stream, encryption_key, stream_config)
                 .await?;
             let ack = handle.append(input).await?;
             match response_mime {
@@ -406,12 +406,12 @@ pub async fn append(
         }
         v1t::stream::AppendRequest::S2s {
             encryption_key,
-            create_stream_config,
+            stream_config,
             inputs,
             response_compression,
         } => {
             let handle = backend
-                .open_for_append(&basin, &stream, encryption_key, create_stream_config)
+                .open_for_append(&basin, &stream, encryption_key, stream_config)
                 .await?;
             let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_append_auto_creates_stream_with_create_stream_config_header() {
+    async fn json_append_auto_creates_stream_with_stream_config_header() {
         let (app, backend, basin, stream) = setup_app_without_stream(
             "append-json-create-config",
             basin_config_with_create_stream_on_append(),
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_with_invalid_create_stream_config_header_is_rejected_without_creating() {
+    async fn append_with_invalid_stream_config_header_is_rejected_without_creating() {
         let (app, backend, basin, stream) = setup_app_without_stream(
             "append-create-config-invalid",
             basin_config_with_create_stream_on_append(),
@@ -853,40 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proto_append_ignores_create_stream_config_header_for_existing_stream() {
-        let (app, backend, basin, stream) = setup_app_with_config(
-            "append-proto-create-config-existing",
-            basin_config_with_create_stream_on_append(),
-            OptionalStreamConfig::default(),
-        )
-        .await;
-        let before = backend
-            .get_stream_config(basin.clone(), stream.clone())
-            .await
-            .expect("get stream config");
-
-        let response = send(
-            &app,
-            request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
-                .header(header::CONTENT_TYPE, "application/protobuf")
-                .header(header::ACCEPT, "application/protobuf")
-                .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
-                .body(Body::from(append_record_input(b"hello").encode_to_vec()))
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let after = backend
-            .get_stream_config(basin, stream)
-            .await
-            .expect("get stream config");
-        assert_eq!(after, before);
-        assert_ne!(after, expected_auto_created_config());
-    }
-
-    #[tokio::test]
-    async fn s2s_append_session_auto_creates_stream_with_create_stream_config_header() {
+    async fn s2s_append_session_auto_creates_stream_with_stream_config_header() {
         let (app, backend, basin, stream) = setup_app_without_stream(
             "append-s2s-create-config",
             basin_config_with_create_stream_on_append(),
@@ -934,59 +901,6 @@ mod tests {
             .await
             .expect("get stream config");
         assert_eq!(config, expected_auto_created_config());
-    }
-
-    /// Clients only start sending frames once they have the response headers, so auto-creation
-    /// must complete (or fail) before the response, never waiting on the body.
-    #[tokio::test]
-    async fn s2s_append_session_auto_creates_before_first_frame() {
-        let (app, backend, basin, stream) = setup_app_without_stream(
-            "append-s2s-create-eager",
-            basin_config_with_create_stream_on_append(),
-        )
-        .await;
-
-        let (frames_tx, frames_rx) =
-            futures::channel::mpsc::unbounded::<Result<Bytes, std::convert::Infallible>>();
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            send(
-                &app,
-                request_builder("POST", format!("/v1/streams/{stream}/records"), &basin)
-                    .header(header::CONTENT_TYPE, "s2s/proto")
-                    .header(STREAM_CONFIG_HEADER.as_str(), STREAM_CONFIG_HEADER_VALUE)
-                    .body(Body::from_stream(frames_rx))
-                    .unwrap(),
-            ),
-        )
-        .await
-        .expect("response headers must not wait for the first frame");
-        assert_eq!(response.status(), StatusCode::OK);
-        // The header is all that is needed, so the stream already exists with the config.
-        let config = backend
-            .get_stream_config(basin.clone(), stream.clone())
-            .await
-            .expect("get stream config");
-        assert_eq!(config, expected_auto_created_config());
-
-        frames_tx
-            .unbounded_send(Ok(SessionMessage::regular(
-                s2s::CompressionAlgorithm::None,
-                &append_record_input(b"first"),
-            )
-            .expect("encode frame")
-            .encode()))
-            .expect("send frame");
-        drop(frames_tx);
-
-        let body = response_bytes(response, "s2s body").await;
-        let SessionMessage::Regular(ack) = decode_single_frame(body, "ack frame") else {
-            panic!("expected regular frame");
-        };
-        let ack = ack
-            .try_into_proto::<proto::AppendAck>()
-            .expect("decode append ack");
-        assert_eq!(ack.end.as_ref().map(|pos| pos.seq_num), Some(1));
     }
 
     #[tokio::test]

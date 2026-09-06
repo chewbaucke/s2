@@ -462,8 +462,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     fencing_token: args.fencing_token,
                     match_seq_num: args.match_seq_num,
                     linger: *args.linger,
-                    create_stream_config: args
-                        .create_stream_config
+                    stream_config: args
+                        .stream_config
                         .map(apply::stream_config_to_sdk),
                 },
             );

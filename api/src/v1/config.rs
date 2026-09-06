@@ -354,11 +354,10 @@ impl From<s2_common::config::StreamConfig> for StreamConfig {
 
 pub static STREAM_CONFIG_HEADER: HeaderName = HeaderName::from_static("s2-stream-config");
 
-/// Value of the `s2-stream-config` header: a JSON-encoded [`StreamConfig`] to apply only if the
-/// request creates the stream on demand. It never reconfigures an existing stream.
+/// Value of the `s2-stream-config` header: a JSON-encoded [`StreamConfig`] to apply if the stream
+/// is created on append. Ignored if the stream already exists.
 ///
-/// Parsing validates the config the same way `CreateStream` does. Only the JSON object form is
-/// accepted, and it must be a single header.
+/// Validated the same way as `CreateStream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamConfigHeader(pub s2_common::config::OptionalStreamConfig);
 
@@ -1094,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn create_stream_config_header_parses_and_validates() {
+    fn stream_config_header_parses_and_validates() {
         let header: StreamConfigHeader =
             r#"{"retention_policy":{"age":3600},"delete_on_empty":{"min_age_secs":300}}"#
                 .parse()
@@ -1130,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn create_stream_config_header_value_roundtrips() {
+    fn stream_config_header_value_roundtrips() {
         let config = StreamConfig {
             storage_class: Some(StorageClass::Express),
             retention_policy: Some(RetentionPolicy::Infinite(InfiniteRetention {})),

@@ -101,9 +101,9 @@ pub struct S2FormatHeader {
 #[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
 #[cfg_attr(feature = "utoipa", into_params(parameter_in = Header))]
 pub struct S2StreamConfigHeader {
-    /// Stream configuration to apply only if this request creates the stream via the basin's `create_stream_on_append` setting,
-    /// encoded as compact JSON in the shape of `StreamConfig`. Unset fields inherit the basin's `default_stream_config`.
-    /// Ignored if the stream already exists; it never reconfigures an existing stream.
+    /// Stream configuration to apply if the stream is created on append, as compact JSON in the shape of `StreamConfig`.
+    /// Unset fields inherit the basin's default stream configuration.
+    /// Ignored if the stream already exists.
     #[cfg_attr(feature = "utoipa", param(
         required = false,
         rename = "s2-stream-config",

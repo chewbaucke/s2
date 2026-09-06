@@ -21,20 +21,20 @@ use crate::backend::error::{AppendError, AppendErrorInternal, StorageError};
 impl Backend {
     /// Open a stream for an append or append session.
     ///
-    /// `create_stream_config` is applied over the basin defaults only if this call creates the
-    /// stream via `create_stream_on_append`, and is otherwise ignored.
+    /// `stream_config` is applied if the stream is created on append. Unset fields inherit the
+    /// basin's default stream configuration. Ignored if the stream already exists.
     pub async fn open_for_append(
         &self,
         basin: &BasinName,
         stream: &StreamName,
         encryption_key: Option<EncryptionKey>,
-        create_stream_config: OptionalStreamConfig,
+        stream_config: OptionalStreamConfig,
     ) -> Result<StreamHandle, AppendError> {
         self.stream_handle_with_auto_create::<AppendError>(
             basin,
             stream,
             AutoCreateOn::Append,
-            create_stream_config,
+            stream_config,
             |cipher| Ok(EncryptionSpec::resolve(cipher, encryption_key)?),
         )
         .await

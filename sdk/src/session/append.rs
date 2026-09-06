@@ -34,7 +34,7 @@ use crate::{
 pub(crate) struct AppendHeaders {
     pub encryption: Option<EncryptionKey>,
     /// `s2-stream-config`
-    pub create_stream_config: Option<ApiStreamConfig>,
+    pub stream_config: Option<ApiStreamConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -735,7 +735,7 @@ async fn connect(
                 stream,
                 ReceiverStream::new(input_rx).map(|i| i.into()),
                 headers.encryption.as_ref(),
-                headers.create_stream_config.as_ref(),
+                headers.stream_config.as_ref(),
                 frame_signal,
             )
             .await?
