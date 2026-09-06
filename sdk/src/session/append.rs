@@ -470,6 +470,96 @@ impl AppendPermits {
     }
 }
 
+/// Maximum number of consecutive `server_draining` reconnects to attempt
+/// before terminating the session.
+///
+/// Draining is not treated as a failure: no retry budget is consumed and no
+/// backoff is applied, because the server is signalling that we should
+/// reconnect promptly elsewhere. That choice removed the only internal bound
+/// on `close()` resolution that previously existed (the standard arm's
+/// `retry_backoff` exhaustion), so a draining node that keeps accepting
+/// connections and emitting `server_draining` across reconnects could block
+/// `AppendSession::close()` and outstanding `BatchSubmitTicket`s for the
+/// entire server drain window when no healthy node was reachable.
+///
+/// This constant restores a client-side bound on that failure tail. It is an
+/// append-specific drain-wait budget, deliberately distinct from
+/// [`crate::reconnect::MAX_ADVISED_RECONNECTS`]: draining is a mandatory "you
+/// must reconnect" signal (not a voluntary "you may reconnect" one), so the
+/// budget is larger than the advice cap, while still bounded so the failure
+/// tail resolves in well under the drain window (a handful of reconnect RTTs
+/// on the in-stream terminal path).
+const MAX_DRAINING_RECONNECTS: usize = 3;
+
+/// A budget of consecutive `server_draining` reconnects that may be attempted
+/// without forward (ack) progress.
+///
+/// See [`MAX_DRAINING_RECONNECTS`] for the rationale. [`DrainingReconnectBudget::record`]
+/// is called once per draining reconnect; once it returns `false` the session
+/// must resolve all outstanding futures and terminate (mirroring the standard
+/// retry-exhaustion path). The budget is reset on ack progress so a healthy
+/// rolling restart — where each drained node is followed by a healthy node
+/// that acks the inflight batch — does not accumulate once per node and
+/// exhaust despite every drain being handled.
+#[derive(Debug, Default)]
+struct DrainingReconnectBudget {
+    count: usize,
+}
+
+impl DrainingReconnectBudget {
+    /// Record a draining reconnect and report whether the budget permits it.
+    ///
+    /// Returns `true` if the reconnect should proceed, or `false` once the
+    /// budget is exhausted, at which point the caller must resolve
+    /// `close_tx`/`ack_tx` and break the retry loop.
+    fn record(&mut self) -> bool {
+        self.count += 1;
+        self.count <= MAX_DRAINING_RECONNECTS
+    }
+
+    /// Reset the budget after forward (ack) progress.
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Resolve every outstanding session future with a terminal error.
+///
+/// This is the shared exhaustion path: the terminal error is published (so
+/// later `BatchSubmitTicket`/`close()` polls that missed the oneshot send
+/// still observe it), every inflight append's `ack_tx`, the stashed
+/// submission's `ack_tx`, and the session `close_tx` are settled with `err`,
+/// and any buffered commands are rejected. The caller breaks the outer retry
+/// loop immediately afterwards.
+async fn resolve_terminal_error(
+    state: &mut SessionState,
+    terminal_err: Arc<OnceLock<AppendSessionError>>,
+    err: AppendSessionError,
+) {
+    let _ = terminal_err.set(err.clone());
+
+    for inflight_append in state.inflight_appends.drain(..) {
+        let _ = inflight_append.ack_tx.send(Err(err.clone()));
+    }
+
+    if let Some(stashed) = state.stashed_submission.take() {
+        let _ = stashed.ack_tx.send(Err(err.clone()));
+    }
+
+    if let Some(done_tx) = state.close_tx.take() {
+        let _ = done_tx.send(Err(err.clone()));
+    }
+
+    state.cmd_rx.close();
+    while let Some(cmd) = state.cmd_rx.recv().await {
+        cmd.reject(err.clone());
+    }
+}
+
 async fn run_session_with_retry(
     client: BasinClient,
     stream: StreamName,
@@ -498,6 +588,7 @@ async fn run_session_with_retry(
     let mut prev_total_acked_records = 0;
     let mut retry_backoff = retry_builder.build();
     let mut advised_reconnects = AdvisedReconnects::default();
+    let mut draining_reconnects = DrainingReconnectBudget::default();
 
     loop {
         let result = run_session(
@@ -527,17 +618,39 @@ async fn run_session_with_retry(
             }
             Err(err) if err.is_server_draining() && state.is_close_complete() => break,
             Err(err) if err.is_server_draining() => {
-                advised_reconnects.record();
-                debug!(
-                    inflight_appends_len = state.inflight_appends.len(),
-                    advised_reconnects = advised_reconnects.count(),
-                    "reconnecting append session while server drains"
-                );
+                // Draining is not a failure, so it does not consume the retry
+                // budget or back off: the server is telling us to reconnect
+                // promptly elsewhere. Forward (ack) progress still resets the
+                // draining budget so a healthy rolling restart does not
+                // accumulate once per drained node.
+                if prev_total_acked_records < state.total_acked_records {
+                    prev_total_acked_records = state.total_acked_records;
+                    retry_backoff.reset();
+                    draining_reconnects.reset();
+                }
+
+                if draining_reconnects.record() {
+                    advised_reconnects.record();
+                    debug!(
+                        inflight_appends_len = state.inflight_appends.len(),
+                        draining_reconnects = draining_reconnects.count(),
+                        "reconnecting append session while server drains"
+                    );
+                } else {
+                    debug!(
+                        %err,
+                        draining_reconnects = draining_reconnects.count(),
+                        "not retrying append session while server drains"
+                    );
+                    resolve_terminal_error(&mut state, terminal_err.clone(), err).await;
+                    break;
+                }
             }
             Err(err) => {
                 if prev_total_acked_records < state.total_acked_records {
                     prev_total_acked_records = state.total_acked_records;
                     retry_backoff.reset();
+                    draining_reconnects.reset();
                 }
 
                 if is_safe_to_retry(
@@ -562,26 +675,7 @@ async fn run_session_with_retry(
                         "not retrying append session"
                     );
 
-                    let err: AppendSessionError = err;
-
-                    let _ = terminal_err.set(err.clone());
-
-                    for inflight_append in state.inflight_appends.drain(..) {
-                        let _ = inflight_append.ack_tx.send(Err(err.clone()));
-                    }
-
-                    if let Some(stashed) = state.stashed_submission.take() {
-                        let _ = stashed.ack_tx.send(Err(err.clone()));
-                    }
-
-                    if let Some(done_tx) = state.close_tx.take() {
-                        let _ = done_tx.send(Err(err.clone()));
-                    }
-
-                    state.cmd_rx.close();
-                    while let Some(cmd) = state.cmd_rx.recv().await {
-                        cmd.reject(err.clone());
-                    }
+                    resolve_terminal_error(&mut state, terminal_err.clone(), err).await;
                     break;
                 }
             }
@@ -1058,7 +1152,9 @@ impl From<usize> for TimerEvent {
 mod tests {
     use http::StatusCode;
 
-    use super::{AppendSessionError, is_safe_to_retry};
+    use super::{
+        AppendSessionError, DrainingReconnectBudget, MAX_DRAINING_RECONNECTS, is_safe_to_retry,
+    };
     use crate::{
         api::{ApiError, ServerErrorBody},
         error::{AppendError, RequestError},
@@ -1183,5 +1279,84 @@ mod tests {
             Some(&signal),
             mode,
         ));
+    }
+
+    #[test]
+    fn draining_reconnect_budget_permits_up_to_max_then_exhausts() {
+        let mut budget = DrainingReconnectBudget::default();
+        assert_eq!(budget.count(), 0);
+
+        // The first MAX_DRAINING_RECONNECTS reconnects are permitted: the
+        // common case where the load balancer reroutes to a healthy node
+        // within a few attempts must not exhaust.
+        for i in 1..=MAX_DRAINING_RECONNECTS {
+            assert!(
+                budget.record(),
+                "draining reconnect {i} should be permitted"
+            );
+            assert_eq!(budget.count(), i);
+        }
+
+        // Further draining reconnects without progress exhaust the budget;
+        // the caller must resolve `close_tx`/`ack_tx` and terminate.
+        assert!(!budget.record(), "reconnect past the budget should exhaust");
+        assert_eq!(budget.count(), MAX_DRAINING_RECONNECTS + 1);
+        assert!(!budget.record());
+    }
+
+    #[test]
+    fn draining_reconnect_budget_resets_on_progress() {
+        let mut budget = DrainingReconnectBudget::default();
+        for _ in 0..MAX_DRAINING_RECONNECTS {
+            assert!(budget.record());
+        }
+        // A healthy round between drains acks the inflight batch (forward
+        // progress) and restarts the budget.
+        budget.reset();
+        assert_eq!(budget.count(), 0);
+
+        // The full budget is available again after progress.
+        for i in 1..=MAX_DRAINING_RECONNECTS {
+            assert!(budget.record());
+            assert_eq!(budget.count(), i);
+        }
+        assert!(!budget.record());
+    }
+
+    #[test]
+    fn draining_reconnect_budget_survives_a_rolling_restart() {
+        // A rolling restart of many nodes: each node drains once, then a
+        // healthy node acks the inflight (progress) before the next node
+        // drains. Without a progress reset this would accumulate once per
+        // drained node and prematurely exhaust; with it, the budget
+        // restarts on every healthy round.
+        let mut budget = DrainingReconnectBudget::default();
+        for node in 0..(MAX_DRAINING_RECONNECTS * 5) {
+            assert!(budget.record(), "drain of node {node} should be permitted");
+            // The load balancer reroutes; the healthy node acks the inflight,
+            // making forward progress before the next drain.
+            budget.reset();
+        }
+        // The session never exhausts despite far more drains than the cap,
+        // because each drain was followed by progress.
+        assert_eq!(budget.count(), 0);
+        // And the next drain (with no progress since) is still permitted.
+        assert!(budget.record());
+    }
+
+    #[test]
+    fn draining_reconnect_budget_exhausts_in_the_failure_tail() {
+        // The failure tail: no healthy node is reachable within the drain
+        // window, so draining repeats with no ack progress. The budget must
+        // exhaust so `close()` and outstanding tickets resolve in bounded
+        // time instead of blocking for the whole drain window.
+        let mut budget = DrainingReconnectBudget::default();
+        for _ in 0..MAX_DRAINING_RECONNECTS {
+            assert!(budget.record());
+        }
+        // No progress ever: the next drain exhausts, terminating the
+        // session and resolving all outstanding futures with the
+        // (no-side-effect) draining error.
+        assert!(!budget.record());
     }
 }
