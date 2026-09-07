@@ -279,14 +279,14 @@ pub async fn run(args: LiteArgs) -> eyre::Result<()> {
         }
     }
 
-    info!("http server stopped; folding SlateDB");
-    let fold_started = Instant::now();
+    info!("http server stopped; closing SlateDB");
+    let close_started = Instant::now();
     shutdown_backend
         .close()
         .await
         .map_err(|error| eyre::eyre!("SlateDB close: {error}"))?;
     info!(
-        elapsed_ms = fold_started.elapsed().as_millis(),
+        elapsed_ms = close_started.elapsed().as_millis(),
         "SlateDB closed"
     );
 

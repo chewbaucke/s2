@@ -71,9 +71,10 @@ impl Backend {
         }
     }
 
-    /// Fold the memtable (L0) and close the writer. Planned stops must call
-    /// this after HTTP drain; SlateDB has no Drop close, so skipping it leaves
-    /// an un-folded WAL chain for the next fence/replay.
+    /// Flush memtables to L0 and close the database.
+    ///
+    /// Call after draining HTTP requests to reduce WAL replay on restart.
+    /// Dropping the backend does not close SlateDB.
     pub async fn close(&self) -> Result<(), slatedb::Error> {
         self.db.close().await
     }
