@@ -71,6 +71,13 @@ impl Backend {
         }
     }
 
+    /// Fold the memtable (L0) and close the writer. Planned stops must call
+    /// this after HTTP drain; SlateDB has no Drop close, so skipping it leaves
+    /// an un-folded WAL chain for the next fence/replay.
+    pub async fn close(&self) -> Result<(), slatedb::Error> {
+        self.db.close().await
+    }
+
     pub(super) fn bgtask_trigger(&self, trigger: BgtaskTrigger) {
         let _ = self.bgtask_trigger_tx.send(trigger);
     }
